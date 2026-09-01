@@ -1,0 +1,13 @@
+{{- if .Values.gatewayParameters.enabled }}
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: {{ .Values.gatewayParameters.name }}
+  labels:
+    {{- include "counter-api.labels" . | nindent 4 }}
+spec:
+  kube:
+    service:
+      extraAnnotations:
+        {{- toYaml .Values.gatewayParameters.extraAnnotations | nindent 8 }}
+{{- end }}

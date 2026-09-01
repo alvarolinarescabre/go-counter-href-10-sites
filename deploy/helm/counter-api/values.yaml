@@ -1,0 +1,45 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/alvarolinarescabre/go-counter-href-10-sites
+  tag: sha-258f8fe491524ec24b84da1c86df08312a110037
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+gateway:
+  enabled: true
+  name: public-nlb-gateway
+  namespace: default
+  className: kgateway
+  listenerName: http
+  port: 80
+  allowedRoutesFrom: All
+
+httpRoute:
+  enabled: true
+  gateway:
+    name: public-nlb-gateway
+    sectionName: http
+  hostnames:
+    - counter-api.alvarolinarescabre.com
+  pathPrefix: /
+
+gatewayParameters:
+  enabled: true
+  name: public-nlb-params
+  extraAnnotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules: "true"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

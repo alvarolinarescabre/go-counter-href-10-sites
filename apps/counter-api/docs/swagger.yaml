@@ -1,0 +1,118 @@
+basePath: /
+definitions:
+  main.MessageResponse:
+    properties:
+      data:
+        example: Ok!
+        type: string
+    type: object
+  main.TagResult:
+    properties:
+      count:
+        example: 42
+        type: integer
+      time:
+        example: 0.1234
+        type: number
+      url:
+        example: https://go.dev
+        type: string
+      url_id:
+        example: 0
+        type: integer
+    type: object
+  main.TagsResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/main.TagResult'
+        type: array
+      total_time:
+        example: 1.2345
+        type: number
+      urls_processed:
+        example: 10
+        type: integer
+    type: object
+info:
+  contact: {}
+  description: Counts words inside links with absolute HTTP(S) hrefs.
+  title: Counter HREF API
+  version: "2.0"
+paths:
+  /:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/main.MessageResponse'
+      summary: API navigation
+      tags:
+      - system
+  /healthcheck:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/main.MessageResponse'
+      summary: Health check
+      tags:
+      - system
+  /v1/cache/clear:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/main.MessageResponse'
+      summary: Clear in-memory cache
+      tags:
+      - system
+  /v1/tags:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/main.TagsResponse'
+      summary: Count links for all configured URLs
+      tags:
+      - tags
+  /v1/tags/{url_id}:
+    get:
+      parameters:
+      - description: Configured URL index
+        in: path
+        maximum: 9
+        minimum: 0
+        name: url_id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/main.TagResult'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/main.MessageResponse'
+      summary: Count links for one configured URL
+      tags:
+      - tags
+schemes:
+- http
+- https
+swagger: "2.0"

@@ -1,0 +1,25 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Values.gateway.name }}
+  labels:
+    {{- include "counter-api.labels" . | nindent 4 }}
+spec:
+  gatewayClassName: {{ .Values.gateway.className }}
+  {{- if .Values.gatewayParameters.enabled }}
+  infrastructure:
+    parametersRef:
+      group: gateway.kgateway.dev
+      kind: GatewayParameters
+      name: {{ .Values.gatewayParameters.name }}
+      namespace: {{ .Values.gatewayParameters.namespace }}
+  {{- end }}
+  listeners:
+    - name: {{ .Values.gateway.listenerName }}
+      protocol: HTTP
+      port: {{ .Values.gateway.port }}
+      allowedRoutes:
+        namespaces:
+          from: {{ .Values.gateway.allowedRoutesFrom }}
+{{- end }}

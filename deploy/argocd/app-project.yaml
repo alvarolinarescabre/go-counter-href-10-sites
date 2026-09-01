@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: go-counter-href-10-sites-project
+  namespace: argocd
+spec:
+  description: Go Gin App to Get href From 10 Websites
+  sourceRepos:
+  - '*'
+  destinations:
+  - server: https://kubernetes.default.svc
+    namespace: counter-api
+  # An AppProject with no clusterResourceWhitelist denies ALL cluster-scoped
+  # resources -- including Namespace, even when it's only implicitly created
+  # via the Application's syncOptions: [CreateNamespace=true] rather than an
+  # explicit manifest. Without this, ArgoCD refuses to sync with "resource
+  # :Namespace is not permitted in project go-counter-href-10-sites-project".
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
