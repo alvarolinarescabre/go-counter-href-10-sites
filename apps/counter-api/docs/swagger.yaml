@@ -73,7 +73,7 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/main.MessageResponse'
-      summary: Clear in-memory cache
+      summary: Force an out-of-band cache refresh
       tags:
       - system
   /v1/tags:
@@ -85,6 +85,10 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/main.TagsResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/main.MessageResponse'
       summary: Count links for all configured URLs
       tags:
       - tags
@@ -107,6 +111,10 @@ paths:
             $ref: '#/definitions/main.TagResult'
         "422":
           description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/main.MessageResponse'
+        "503":
+          description: Service Unavailable
           schema:
             $ref: '#/definitions/main.MessageResponse'
       summary: Count links for one configured URL

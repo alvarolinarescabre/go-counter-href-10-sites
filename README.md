@@ -29,7 +29,24 @@ The server listens on `http://localhost:8080` by default. Configure it with:
 
 - `PORT`: HTTP port, default `8080`
 - `TARGET_URLS`: comma-separated URLs, default is the ten configured sites
-- `HTTP_TIMEOUT_SECONDS`: HTTP request timeout, default `10`
+- `HTTP_TIMEOUT_SECONDS`: per outbound fetch timeout, default `10`
+- `REFRESH_INTERVAL_SECONDS`: how often the background refresher re-fetches every
+  target, default `60`
+
+### Request path is cache-only
+
+The target URLs are fixed, so counter-api does **not** fetch them on the request
+path. A background refresher fetches all targets every `REFRESH_INTERVAL_SECONDS`
+(the fan-out is concurrent), serializes the result once, and atomically swaps it
+into an in-memory snapshot. `GET /v1/tags` and `GET /v1/tags/{id}` are then a
+lock-free read of pre-serialized JSON — no goroutines, no HTTP calls, no
+marshaling per request — which is what lets a single instance sustain thousands
+of requests per second. `GET /v1/cache/clear` forces one out-of-band refresh.
+The cache is warmed synchronously before the server accepts traffic; a request
+that arrives before the first refresh finishes gets `503`.
+
+See [apps/counter-api/loadtest/](apps/counter-api/loadtest/) for a 5000 req/s
+load test (k6 / vegeta), a deterministic stub origin, and hot-path benchmarks.
 
 Run tests with:
 
@@ -44,7 +61,7 @@ go test ./...
 - `GET /healthcheck` - health check
 - `GET /v1/tags` - count links for all configured URLs
 - `GET /v1/tags/{url_id}` - count links for one configured URL
-- `GET /v1/cache/clear` - clear cache response compatibility endpoint
+- `GET /v1/cache/clear` - force an out-of-band refresh of the cached snapshot
 - `GET /docs` - redirects directly to the interactive Swagger UI
 - `GET /swagger/index.html` - interactive Swagger UI
 

@@ -61,7 +61,7 @@ const docTemplate = `{
                 "tags": [
                     "system"
                 ],
-                "summary": "Clear in-memory cache",
+                "summary": "Force an out-of-band cache refresh",
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -86,6 +86,12 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/main.TagsResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/main.MessageResponse"
                         }
                     }
                 }
@@ -120,6 +126,12 @@ const docTemplate = `{
                     },
                     "422": {
                         "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/main.MessageResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
                         "schema": {
                             "$ref": "#/definitions/main.MessageResponse"
                         }
