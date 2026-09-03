@@ -19,10 +19,6 @@ on:
         description: "Port PR entity identifier"
         required: false
         type: string
-      port_run_id:
-        description: "Port workflow run ID"
-        required: true
-        type: string
 
 jobs:
   deploy:
@@ -87,4 +83,3 @@ jobs:
           runId: ${{ inputs.port_run_id }}
           status: FAILURE
           logMessage: "ArgoCD sync FAILED for ${{ inputs.service }}"
-          
