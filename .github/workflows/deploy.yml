@@ -25,14 +25,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Log to Port
-          uses: port-labs/port-github-action@v1
-          with:
-            clientId: ${{ secrets.PORT_CLIENT_ID }}
-            clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
-            baseUrl: https://api.port.io
-            operation: PATCH_RUN
-            runId: ${{ inputs.port_run_id }}
-            logMessage: "ArgoCD sync completed successfully for counter-api"
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.port.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: "ArgoCD sync completed successfully for counter-api"
 
       - name: Checkout code
         uses: actions/checkout@v4
