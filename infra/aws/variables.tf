@@ -192,3 +192,27 @@ variable "argocd_gateway_annotations" {
     "service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules" = "true"
   }
 }
+
+
+variable "ecr_repository_name" {
+  description = "Name of the ECR repository holding the counter-api image. Must match the repository part of image.repository in the Helm values and of ECR_REPOSITORY in the deploy workflow."
+  type        = string
+  default     = "counter-api"
+}
+
+variable "ecr_untagged_expiry_days" {
+  description = "Days before an untagged image in that repository is expired by the lifecycle policy."
+  type        = number
+  default     = 1
+}
+
+variable "ecr_keep_last_images" {
+  description = <<-EOT
+    How many `sha-` tagged images to keep. Older ones are expired by the
+    lifecycle policy — keep this comfortably above the number of builds you
+    might do between deployments, since expiring the image a running
+    Deployment references would break any pod that has to be rescheduled.
+  EOT
+  type        = number
+  default     = 20
+}

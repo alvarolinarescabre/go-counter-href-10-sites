@@ -91,7 +91,8 @@ manifests and then hands off control to Argo CD's own sync loop.
     ├── 03-argocd.tf                   # Argo CD Helm release
     ├── 04-ingress-controller.tf       # Gateway API CRDs + kgateway (CRDs and controller) via ArgoCD manifests
     ├── 05-app-deployment.tf           # ArgoCD AppProject + Application for counter-api
-    └── 06-argocd-ingress.tf           # Optional kgateway Gateway/HTTPRoute exposing the Argo CD UI
+    ├── 06-argocd-ingress.tf           # Optional kgateway Gateway/HTTPRoute exposing the Argo CD UI
+    └── 07-ecr.tf                      # ECR repository + lifecycle policy for the app image
 ```
 
 ## Resources deployed
@@ -136,6 +137,17 @@ manifests and then hands off control to Argo CD's own sync loop.
   for the application Gateway, `argocd_gateway_tls_certificate_arn` for a dedicated Argo CD
   one. TLS terminates **at the load balancer**: the extra Gateway listener speaks plain
   HTTP because the NLB hands it an already-decrypted stream.
+
+### Container registry (`07-ecr.tf`)
+- **ECR repository** (`var.ecr_repository_name`, default `counter-api`) holding the
+  application image, with `scan_on_push` and `IMMUTABLE` tags — the pipeline only ever
+  pushes `sha-<commit>`, so an overwrite is always a mistake and the registry rejects it.
+- **Lifecycle policy**: expires untagged images after `var.ecr_untagged_expiry_days` and
+  keeps the newest `var.ecr_keep_last_images` `sha-` builds.
+- No pull credential is needed in the cluster: EKS Auto Mode's node IAM role carries
+  `AmazonEC2ContainerRegistryPullOnly`, so kubelet pulls with the node's own identity.
+- `force_delete = true` so `terraform destroy` does not stall on a repository that still
+  holds images.
 
 ### Application (`05-app-deployment.tf`)
 - **AppProject** `go-counter-href-10-sites-project` scoping allowed source repos/destinations.
@@ -386,12 +398,17 @@ are known; avoid AWS managed `PowerUserAccess`/`AdministratorAccess` for the lon
 | `argocd_gateway_tls_certificate_arn` | ACM certificate ARN; enables port 443 on the dedicated NLB | `""` (no TLS) |
 | `argocd_gateway_tls_port`  | Frontend port that terminates TLS      | `443`               |
 | `argocd_gateway_tls_negotiation_policy` | ELB security policy for that listener | `ELBSecurityPolicy-TLS13-1-2-2021-06` |
+| `ecr_repository_name`   | ECR repository holding the app image  | `counter-api`       |
+| `ecr_untagged_expiry_days` | Days before untagged images expire | `1`                |
+| `ecr_keep_last_images`  | How many `sha-` images to keep        | `20`                |
 
 Naming is derived in [locals.tf](locals.tf) as `<project_name>-<environment>`, e.g.
 `chamo-dev-vpc`, `chamo-dev-cluster`.
 
 ## Outputs
 
+- `ecr_repository_url` — registry path the deploy workflow pushes to; must match
+  `image.repository` in the Helm values.
 - `instructions` — post-apply cheat sheet with the exact `kubectl`/`aws` commands for
   configuring kubeconfig, retrieving the Argo CD admin password, and reaching the sample
   app through the Gateway/NLB. See [outputs.tf](outputs.tf).

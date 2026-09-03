@@ -11,9 +11,8 @@ It uses Gin for HTTP routing and Swaggo for an interactive OpenAPI UI.
   bootstrap manifests (Gateway API CRDs, kgateway CRDs/controller, `GatewayParameters`)
 - `infra/aws/` - Terraform that provisions the EKS cluster and bootstraps Argo CD; see
   [infra/aws/README.md](infra/aws/README.md)
-- `.github/workflows/` - tests and image publishing to GHCR (`docker-publish.yml`), GitOps
-  promotion (same workflow), and the Terraform AWS deployment pipeline
-  (`terraform-aws.yml`)
+- `.github/workflows/deploy.yml` - tests, image build and publish to GHCR, GitOps
+  promotion (commits the new tag into the chart), and the Argo CD sync
 
 ## Local Development
 
@@ -137,11 +136,45 @@ kubectl apply -f deploy/argocd/app-project.yaml
 kubectl apply -f deploy/argocd/application.yaml
 ```
 
-A push to `main` runs `go test ./...`, builds and publishes
-`ghcr.io/alvarolinarescabre/go-counter-href-10-sites`, and commits the
-immutable `sha-<commit>` tag to the Helm values file. ArgoCD detects that Git
-change and synchronizes the chart. Configure an `imagePullSecret` in the
-`counter-api` namespace if the GHCR package is private.
+A push to `main` touching `apps/counter-api/**` runs
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml): `go test ./...`,
+then a build and push to the **Amazon ECR** repository provisioned by
+[infra/aws/07-ecr.tf](infra/aws/07-ecr.tf), tagged with the immutable
+`sha-<commit>`, then a commit of that tag into
+[deploy/helm/counter-api/values.yaml](deploy/helm/counter-api/values.yaml).
+
+The registry lives in the cluster's own AWS account, which is what removes the
+pull credential problem: EKS Auto Mode's node IAM role carries
+`AmazonEC2ContainerRegistryPullOnly`, so kubelet authenticates with the node's
+own identity. There is no `imagePullSecret` anywhere, nothing to rotate, and
+the pull never leaves AWS.
+
+That commit is the deploy: Argo CD watches the chart path and syncs it. The
+workflow's last job only asks Argo CD to reconcile *now* rather than on its own
+polling interval, and it is skipped when the `ARGOCD_SERVER` /
+`ARGOCD_AUTH_TOKEN` secrets are absent — the Application's automated sync
+(`prune`, `selfHeal`) still picks the change up. Nothing in CI runs `kubectl`.
+
+The workflow filters out `deploy/**` so its own promotion commit does not
+retrigger it. Three things it needs from you:
+
+1. **`terraform apply` first.** The ECR repository has to exist before the first
+   push. Copy `terraform output ecr_repository_url` into `image.repository` in
+   the Helm values if your account or region differs from what is committed there.
+2. **AWS credentials as repo secrets** — `AWS_ACCESS_KEY_ID` /
+   `AWS_SECRET_ACCESS_KEY` for a user allowed to push to that repository
+   (`ecr:GetAuthorizationToken` plus the `ecr:*Layer*`/`ecr:PutImage` set), and
+   optionally the `AWS_REGION` / `ECR_REPOSITORY` repo variables. This is the
+   cost of ECR over GHCR: pushing needs real credentials rather than the
+   built-in `GITHUB_TOKEN`. Swapping the static key for OIDC
+   (`role-to-assume`) is a drop-in change to the one step that configures them.
+3. **Push access to `main`.** The promotion commits straight to the branch, so
+   branch protection requiring a pull request will block it.
+
+The repository is `IMMUTABLE`, so the pipeline pushes only `sha-<commit>` and
+never a floating `latest` — a second push of such a tag would be rejected. A
+lifecycle policy keeps the last 20 `sha-` images and expires untagged ones after
+a day.
 
 ## Infrastructure (EKS + ArgoCD bootstrap)
 

@@ -1,15 +1,42 @@
-name: Deploy to Kubernetes (ArgoCD)
+name: Build, publish and deploy (ArgoCD)
+
+# GitOps pipeline for apps/counter-api:
+#
+#   test -> build & push image to ECR -> commit the new tag into the Helm
+#   values -> tell Argo CD to sync that commit
+#
+# The image lives in the cluster's own AWS account: EKS Auto Mode's node role
+# carries AmazonEC2ContainerRegistryPullOnly, so kubelet pulls with its own IAM
+# identity and no registry credential ever exists inside the cluster.
+#
+# Argo CD is the only thing that talks to the cluster: this workflow never runs
+# kubectl. It moves the desired state in git (deploy/helm/counter-api/values.yaml)
+# and then just asks Argo CD to reconcile now instead of waiting for its own
+# ~3 minute polling loop.
 
 on:
+  push:
+    branches: [main]
+    # Deliberately excludes deploy/**: the promote job below commits back to
+    # main, and without this filter that commit would retrigger the workflow in
+    # a loop.
+    paths:
+      - "apps/counter-api/**"
+      - ".github/workflows/deploy.yml"
+
+  # Kept for the Port (getport.io) integration, which dispatches this workflow
+  # after a merge. Everything is optional so the workflow can also be run by
+  # hand from the Actions tab.
   workflow_dispatch:
     inputs:
       port_run_id:
         description: "Port workflow run ID"
-        required: true
+        required: false
         type: string
       service:
-        description: "Port service identifier"
-        required: true
+        description: "Argo CD application to sync"
+        required: false
+        default: counter-api
         type: string
       branch:
         description: "Branch that was merged"
@@ -20,34 +47,189 @@ on:
         required: false
         type: string
 
+# One deploy at a time per branch. Not cancel-in-progress: a cancelled run can
+# leave an image pushed but the values bump unmade.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/counter-api/go.mod
+          cache-dependency-path: apps/counter-api/go.sum
+
+      - name: Run tests
+        working-directory: apps/counter-api
+        run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+      tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image reference
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY || 'counter-api' }}
+        run: |
+          # The tag is the full commit SHA, so every deployed image traces back
+          # to exactly one commit. The repository is IMMUTABLE (see
+          # infra/aws/07-ecr.tf), which is why nothing floating like `latest`
+          # gets pushed: re-pushing such a tag would be rejected.
+          tag="sha-${GITHUB_SHA}"
+          {
+            echo "name=${REGISTRY}/${REPOSITORY}"
+            echo "tag=${tag}"
+            echo "ref=${REGISTRY}/${REPOSITORY}:${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/counter-api
+          file: apps/counter-api/Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Keeps one manifest per tag instead of adding an unknown/unknown
+          # provenance entry to the repository.
+          provenance: false
+
+      - name: Summary
+        run: echo "Pushed \`${{ steps.image.outputs.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit the values bump back to main
+    outputs:
+      committed: ${{ steps.commit.outputs.committed }}
+    steps:
+      - uses: actions/checkout@v4
         with:
           ref: main
 
-      - name: Install ArgoCD CLI
-        run: |
-          curl -sSL -o /usr/local/bin/argocd \
-            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
-
-      - name: Sync ArgoCD Application
+      - name: Point the chart at the new image
         env:
-          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VALUES: deploy/helm/counter-api/values.yaml
         run: |
-          argocd app sync ${{ inputs.service }} \
-            --server $ARGOCD_SERVER \
-            --auth-token $ARGOCD_AUTH_TOKEN \
-            --grpc-web \
-            --force
+          set -euo pipefail
+          # sed rather than yq: values.yaml carries explanatory comments and a
+          # rewrite-the-document tool is a needless risk for a one-line change.
+          # `  tag:` at two-space indent is image.tag and nothing else -- assert
+          # that before touching the file, so a future restructuring fails here
+          # instead of silently patching the wrong key.
+          matches="$(grep -c '^  tag: ' "$VALUES")"
+          if [ "$matches" -ne 1 ]; then
+            echo "::error::expected exactly one '  tag:' line in $VALUES, found $matches"
+            exit 1
+          fi
+          sed -i -E "s|^(  tag: ).*|\1${TAG}|" "$VALUES"
+          grep '^  tag: ' "$VALUES"
 
-          argocd app wait ${{ inputs.service }} \
-            --server $ARGOCD_SERVER \
-            --auth-token $ARGOCD_AUTH_TOKEN \
-            --grpc-web \
-            --health
+      - name: Commit and push
+        id: commit
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/helm/counter-api/values.yaml
+
+          if git diff --staged --quiet; then
+            echo "Chart already points at ${TAG}; nothing to commit."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore(deploy): counter-api image ${TAG}"
+          # Another run may have pushed while this one was building.
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+  sync:
+    needs: [build, promote]
+    runs-on: ubuntu-latest
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      APP: ${{ inputs.service || 'counter-api' }}
+    steps:
+      - name: Check Argo CD credentials
+        id: creds
+        run: |
+          if [ -z "${ARGOCD_SERVER}" ] || [ -z "${ARGOCD_AUTH_TOKEN}" ]; then
+            echo "::notice::ARGOCD_SERVER/ARGOCD_AUTH_TOKEN not set -- skipping the explicit sync. The Application has automated sync (prune + selfHeal), so Argo CD picks the new commit up on its own within a few minutes."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Argo CD CLI
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          sudo curl -sSLf -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo chmod +x /usr/local/bin/argocd
+          argocd version --client --short
+
+      - name: Sync and wait
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          args="--server $ARGOCD_SERVER --auth-token $ARGOCD_AUTH_TOKEN --grpc-web"
+
+          # Argo CD caches the repo; without a hard refresh the sync below can
+          # replay the commit from before the promote job pushed.
+          argocd app get "$APP" $args --hard-refresh > /dev/null
+
+          # No --force on purpose: it replaces resources instead of patching
+          # them, which for the Gateway's Service means churning the NLB (new
+          # address, downtime) on an ordinary image bump.
+          argocd app sync "$APP" $args --timeout 300
+
+          argocd app wait "$APP" $args --health --timeout 300
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deploy"
+            echo ""
+            echo "- Image: \`${{ needs.build.outputs.image }}\`"
+            echo "- Values bump committed: \`${{ needs.promote.outputs.committed }}\`"
+            echo "- Argo CD sync: \`${{ steps.creds.outputs.available == 'true' && 'requested' || 'skipped (automated sync will pick it up)' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
