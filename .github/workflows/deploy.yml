@@ -51,3 +51,4 @@ jobs:
             --auth-token $ARGOCD_AUTH_TOKEN \
             --grpc-web \
             --health
+            
