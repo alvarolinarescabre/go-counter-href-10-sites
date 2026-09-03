@@ -24,16 +24,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Report to Port
-        uses: port-labs/port-github-action@v2
-        with:
-          clientId: ${{ secrets.PORT_CLIENT_ID }}
-          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
-          baseUrl: https://api.port.io
-          operation: PATCH_RUN
-          runId: ${{ github.event.inputs.port_run_id }}
-          logMessage: "ArgoCD sync completed for counter-api"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -61,27 +51,3 @@ jobs:
             --auth-token $ARGOCD_AUTH_TOKEN \
             --grpc-web \
             --health
-    
-      - name: Report success to Port
-        if: success()
-        uses: port-labs/port-github-action@v2
-        with:
-          clientId: ${{ secrets.PORT_CLIENT_ID }}
-          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
-          baseUrl: https://api.port.io
-          operation: PATCH_RUN
-          runId: ${{ inputs.port_run_id }}
-          status: SUCCESS
-          logMessage: "ArgoCD sync completed successfully for ${{ inputs.service }}"
-
-      - name: Report failure to Port
-        if: failure()
-        uses: port-labs/port-github-action@v2
-        with:
-          clientId: ${{ secrets.PORT_CLIENT_ID }}
-          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
-          baseUrl: https://api.port.io
-          operation: PATCH_RUN
-          runId: ${{ inputs.port_run_id }}
-          status: FAILURE
-          logMessage: "ArgoCD sync FAILED for ${{ inputs.service }}"
