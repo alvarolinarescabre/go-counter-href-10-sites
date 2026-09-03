@@ -85,4 +85,3 @@ jobs:
           runId: ${{ inputs.port_run_id }}
           status: FAILURE
           logMessage: "ArgoCD sync FAILED for ${{ inputs.service }}"
-          
