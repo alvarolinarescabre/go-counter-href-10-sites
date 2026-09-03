@@ -1,4 +1,7 @@
 {{- if .Values.gateway.enabled }}
+{{- if and .Values.gateway.https.enabled (not .Values.gatewayParameters.tls.certificateArn) }}
+{{- fail "gateway.https.enabled needs gatewayParameters.tls.certificateArn: the NLB terminates TLS, so without an ACM certificate the 443 listener would serve plain HTTP." }}
+{{- end }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -13,7 +16,6 @@ spec:
       group: gateway.kgateway.dev
       kind: GatewayParameters
       name: {{ .Values.gatewayParameters.name }}
-      namespace: {{ .Values.gatewayParameters.namespace }}
   {{- end }}
   listeners:
     - name: {{ .Values.gateway.listenerName }}
@@ -22,4 +24,17 @@ spec:
       allowedRoutes:
         namespaces:
           from: {{ .Values.gateway.allowedRoutesFrom }}
+    {{- if .Values.gateway.https.enabled }}
+    {{- /*
+      protocol is HTTP, not HTTPS, and there is no `tls:` block on purpose: the
+      NLB terminates TLS with the ACM certificate and forwards the decrypted
+      stream to this port, so the Gateway never sees a TLS handshake.
+    */}}
+    - name: {{ .Values.gateway.https.listenerName }}
+      protocol: HTTP
+      port: {{ .Values.gateway.https.port }}
+      allowedRoutes:
+        namespaces:
+          from: {{ .Values.gateway.allowedRoutesFrom }}
+    {{- end }}
 {{- end }}

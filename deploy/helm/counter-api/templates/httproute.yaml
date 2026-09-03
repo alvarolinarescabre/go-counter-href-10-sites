@@ -7,10 +7,19 @@ metadata:
     {{- include "counter-api.labels" . | nindent 4 }}
 spec:
   parentRefs:
+    {{- if .Values.httpRoute.gateway.sectionNames }}
+    {{- range .Values.httpRoute.gateway.sectionNames }}
+    - name: {{ $.Values.httpRoute.gateway.name }}
+      sectionName: {{ . }}
+    {{- end }}
+    {{- else }}
+    {{- /* No sectionName at all: attach to every listener on the Gateway. */}}
     - name: {{ .Values.httpRoute.gateway.name }}
-      sectionName: {{ .Values.httpRoute.gateway.sectionName }}
+    {{- end }}
+  {{- with .Values.httpRoute.hostnames }}
   hostnames:
-    {{- toYaml .Values.httpRoute.hostnames | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   rules:
     - matches:
         - path:

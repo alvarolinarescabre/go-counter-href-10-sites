@@ -17,12 +17,27 @@ gateway:
   listenerName: http
   port: 80
   allowedRoutesFrom: All
+  # Second listener fronted by the NLB's TLS port. The NLB terminates TLS with
+  # the ACM certificate below and forwards plain HTTP to this port, so the
+  # listener protocol is HTTP -- there is no certificate inside the cluster.
+  # Requires gatewayParameters.tls.certificateArn.
+  https:
+    enabled: true
+    listenerName: https
+    port: 443
 
 httpRoute:
   enabled: true
   gateway:
     name: public-nlb-gateway
-    sectionName: http
+    # Gateway listeners this route attaches to. Leave the list empty to attach
+    # to every listener the Gateway exposes.
+    sectionNames:
+      - http
+      - https
+  # Leave empty (hostnames: []) to match any Host header, which lets you reach
+  # the app straight on the Gateway's NLB DNS name with no domain of your own.
+  # Only one hostname-less route can own "/" on a given Gateway listener.
   hostnames:
     - counter-api.alvarolinarescabre.com
   pathPrefix: /
@@ -35,6 +50,15 @@ gatewayParameters:
     service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
     service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
     service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules: "true"
+  tls:
+    # ARN of the ACM certificate the NLB serves on the TLS port(s) below. Must
+    # live in the same region as the cluster and cover the httpRoute hostnames.
+    # Setting this adds the aws-load-balancer-ssl-* annotations; it is required
+    # by gateway.https.enabled.
+    certificateArn: "arn:aws:acm:eu-west-1:133630512259:certificate/c0116ba9-38d4-4147-a445-b3837a83f88d"
+    # Frontend ports that terminate TLS. Everything else stays plain HTTP.
+    ports: "443"
+    negotiationPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
 
 resources:
   requests:

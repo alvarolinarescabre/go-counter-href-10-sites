@@ -1,4 +1,19 @@
 {{- if .Values.gatewayParameters.enabled }}
+{{- /*
+  TLS on the NLB is pure Service-annotation configuration for the AWS load
+  balancer controller; kgateway just passes extraAnnotations through to the
+  Service it provisions for the Gateway. Explicit extraAnnotations win over the
+  ones derived from .tls, so a value here can always override.
+*/}}
+{{- $tls := dict }}
+{{- with .Values.gatewayParameters.tls.certificateArn }}
+{{- $_ := set $tls "service.beta.kubernetes.io/aws-load-balancer-ssl-cert" . }}
+{{- $_ := set $tls "service.beta.kubernetes.io/aws-load-balancer-ssl-ports" (toString $.Values.gatewayParameters.tls.ports) }}
+{{- with $.Values.gatewayParameters.tls.negotiationPolicy }}
+{{- $_ := set $tls "service.beta.kubernetes.io/aws-load-balancer-ssl-negotiation-policy" . }}
+{{- end }}
+{{- end }}
+{{- $annotations := merge (deepCopy (.Values.gatewayParameters.extraAnnotations | default dict)) $tls }}
 apiVersion: gateway.kgateway.dev/v1alpha1
 kind: GatewayParameters
 metadata:
@@ -9,5 +24,5 @@ spec:
   kube:
     service:
       extraAnnotations:
-        {{- toYaml .Values.gatewayParameters.extraAnnotations | nindent 8 }}
+        {{- toYaml $annotations | nindent 8 }}
 {{- end }}

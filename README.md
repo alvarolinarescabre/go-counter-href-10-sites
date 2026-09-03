@@ -83,6 +83,31 @@ httpRoute:
     - api.example.com
 ```
 
+To serve it over HTTPS, put an ACM certificate on the NLB — it terminates TLS
+and forwards plain HTTP to a second Gateway listener, so the listener protocol
+stays `HTTP` and nothing inside the cluster handles a certificate:
+
+```yaml
+gateway:
+  https:
+    enabled: true   # adds the :443 listener
+gatewayParameters:
+  tls:
+    certificateArn: arn:aws:acm:eu-west-1:<account>:certificate/<id>
+httpRoute:
+  gateway:
+    sectionNames: [http, https]
+```
+
+The certificate must be in the cluster's region and cover the route hostnames.
+
+The same mechanism can expose the Argo CD UI itself: `infra/aws/` has an
+`enable_argocd_route` variable that creates an `HTTPRoute` for `argocd-server`,
+either on the Gateway above or on a dedicated one with its own NLB
+(`argocd_gateway_create`). It is off by default — without it Argo CD is reachable
+only through `kubectl port-forward`. See
+[infra/aws/README.md](infra/aws/README.md#argo-cd-ingress-06-argocd-ingresstf-optional).
+
 The Gateway API CRDs and the `kgateway` GatewayClass must already exist in the
 cluster. kgateway provisions an external address for the Gateway; create a DNS
 `A` or `CNAME` record for the configured hostname pointing to that address.

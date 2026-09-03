@@ -90,7 +90,8 @@ manifests and then hands off control to Argo CD's own sync loop.
     ├── 02-eks.tf                      # EKS module (terraform-aws-modules/eks)
     ├── 03-argocd.tf                   # Argo CD Helm release
     ├── 04-ingress-controller.tf       # Gateway API CRDs + kgateway (CRDs and controller) via ArgoCD manifests
-    └── 05-app-deployment.tf           # ArgoCD AppProject + Application for counter-api
+    ├── 05-app-deployment.tf           # ArgoCD AppProject + Application for counter-api
+    └── 06-argocd-ingress.tf           # Optional kgateway Gateway/HTTPRoute exposing the Argo CD UI
 ```
 
 ## Resources deployed
@@ -129,12 +130,80 @@ manifests and then hands off control to Argo CD's own sync loop.
 - `parameters.yaml` (`GatewayParameters`) provisions the Gateway's Kubernetes `Service`
   as an internet-facing **AWS Network Load Balancer** (`aws-load-balancer-type: external`,
   `nlb-target-type: ip`).
+- The NLB serves HTTP on port 80, and HTTPS on port 443 once an ACM certificate is
+  configured — `gatewayParameters.tls.certificateArn` + `gateway.https.enabled` in
+  [`../../deploy/helm/counter-api/values.yaml`](../../deploy/helm/counter-api/values.yaml)
+  for the application Gateway, `argocd_gateway_tls_certificate_arn` for a dedicated Argo CD
+  one. TLS terminates **at the load balancer**: the extra Gateway listener speaks plain
+  HTTP because the NLB hands it an already-decrypted stream.
 
 ### Application (`05-app-deployment.tf`)
 - **AppProject** `go-counter-href-10-sites-project` scoping allowed source repos/destinations.
 - **Application** `counter-api`, sourced from this same repo
   (`deploy/helm/counter-api`, branch `main`), deployed into the `counter-api` namespace
   with automated sync (`prune`, `selfHeal`, `CreateNamespace=true`).
+
+### Argo CD ingress (`06-argocd-ingress.tf`, optional)
+
+Off by default — Argo CD ships no Ingress/Gateway of its own, so out of the box the UI is
+only reachable through `kubectl port-forward`. Set `enable_argocd_route = true` to publish
+it through kgateway:
+
+- **HTTPRoute** `argocd-server` in the `argocd` namespace, matching
+  `var.argocd_hostname` and forwarding to the `argocd-server` Service on **plain HTTP
+  port 80** — Argo CD runs with `server.insecure = true` (see `03-argocd.tf`), so TLS, if
+  any, terminates at the Gateway/NLB rather than at the pod.
+- The Gateway it attaches to depends on `argocd_gateway_create`:
+  - `false` (default) — reuse an existing Gateway (`argocd_gateway_name` /
+    `argocd_gateway_namespace`, by default the `public-nlb-gateway` the counter-api chart
+    creates), so Argo CD and the application share one NLB. That Gateway must accept
+    routes from other namespaces; the chart's does (`allowedRoutes.namespaces.from: All`).
+  - `true` — also create a dedicated **Gateway** `argocd-gateway` plus a
+    **GatewayParameters** `argocd-nlb-params` in the `argocd` namespace, which makes
+    kgateway provision a **second, Argo-CD-only NLB** (extra AWS cost, but keeps the
+    control plane off the application load balancer).
+
+**TLS.** `argocd_gateway_tls_certificate_arn` (dedicated Gateway only) adds a second
+listener on port 443 and the `aws-load-balancer-ssl-*` annotations, so the NLB terminates
+TLS with your ACM certificate and forwards plain HTTP inwards — the listener protocol stays
+`HTTP` and no certificate ever enters the cluster. The HTTPRoute then attaches to both
+listeners automatically. When *reusing* the counter-api Gateway instead, TLS comes from
+that chart (`gatewayParameters.tls.certificateArn`); set
+`argocd_gateway_section_name = "https"` so Argo CD only answers on the encrypted port.
+
+kgateway routes on the `Host` header, so `var.argocd_hostname` has to resolve to the
+Gateway's NLB address — a DNS record, or an `/etc/hosts` entry for a `.local` name.
+
+### No domain? You don't need one
+
+Route 53 registration is not required — nothing here uses Route 53, and the Gateway's NLB
+already has a working DNS name of its own (`k8s-….elb.amazonaws.com`). Three ways to reach
+the services without buying anything:
+
+1. **Drop the hostname.** `argocd_hostname = ""` (Terraform) or `httpRoute.hostnames: []`
+   (chart) omits `hostnames` from the HTTPRoute, so it matches any `Host` and you just open
+   the NLB DNS name. Only one hostname-less route can sensibly own `/` per listener, so if
+   both Argo CD and the app go hostname-less, give Argo CD its own Gateway
+   (`argocd_gateway_create = true`) — and note the warning on `argocd_hostname`: on the
+   shared, internet-facing Gateway a hostname-less route makes the unencrypted admin UI the
+   default backend.
+2. **Wildcard DNS.** `sslip.io`/`nip.io` resolve `<anything>.<ip>.sslip.io` to `<ip>`, so
+   `argocd.<nlb-ip>.sslip.io` gives you a real, distinct hostname for free. Resolve the NLB
+   name to an IP first (`dig +short <nlb-dns>`); those IPs can change over the NLB's life,
+   so re-check if it stops resolving.
+3. **`/etc/hosts`.** Map any invented name (`argocd.chamo.local`) to a current NLB IP. Works
+   from your machine only.
+
+If you do want a real domain, register it anywhere — the DNS provider is independent of
+AWS. Cloudflare Registrar or Porkbun sell them at cost (~10 USD/year), and
+[freedns.afraid.org](https://freedns.afraid.org) hands out free subdomains that support
+`CNAME` records, which is what you need to point at an NLB DNS name (an NLB has no stable
+IP, so `A`-record-only providers like DuckDNS are a poor fit). Then just `CNAME` the
+hostname at the NLB and set `argocd_hostname` / `httpRoute.hostnames` to it.
+
+In the reuse case, the shared Gateway is created by Argo CD syncing the chart, not by
+Terraform, so the HTTPRoute can be applied before its parent exists. That is not an apply
+error: the route stays `Accepted=False` until kgateway sees the Gateway and reconciles it.
 
 ## Prerequisites
 
@@ -184,10 +253,19 @@ aws eks update-kubeconfig --region <region> --name <cluster_name>
 
 **2. Log in to Argo CD:**
 ```bash
-kubectl get ingress -n argocd            # use the ADDRESS of argocd-server
+# initial 'admin' password (either way)
 kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath="{.data.password}" | base64 -d   # initial 'admin' password
+  -o jsonpath="{.data.password}" | base64 -d
+
+# enable_argocd_route = false (default): no external address, tunnel to it
+kubectl port-forward svc/argocd-server -n argocd 8080:80   # then http://localhost:8080
+
+# enable_argocd_route = true: resolve var.argocd_hostname to the Gateway's NLB
+kubectl get svc <gateway-name> -n <gateway-namespace> \
+  -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
 ```
+
+The `instructions` output prints whichever of the two applies to your configuration.
 
 **3. Reach the sample application:**
 ```bash
@@ -296,6 +374,18 @@ are known; avoid AWS managed `PowerUserAccess`/`AdministratorAccess` for the lon
 | `public_subnets`        | Public subnet CIDR blocks             | `10.0.101.0/24`, `10.0.102.0/24`, `10.0.103.0/24` |
 | `argocd_namespace`      | Namespace for Argo CD                 | `argocd`            |
 | `argocd_chart_version`  | Argo CD Helm chart version            | `7.8.2`             |
+| `enable_argocd_route`   | Expose the Argo CD UI through kgateway | `false`            |
+| `argocd_hostname`       | Hostname matched by the Argo CD HTTPRoute | `argocd.chamo.local` |
+| `argocd_gateway_create` | Create a dedicated Gateway (+ its own NLB) for Argo CD instead of reusing an existing one | `false` |
+| `argocd_gateway_name`   | Existing Gateway to attach the Argo CD route to | `public-nlb-gateway` |
+| `argocd_gateway_namespace` | Namespace of that existing Gateway | `counter-api`    |
+| `argocd_gateway_section_name` | Listener on that Gateway            | `http`        |
+| `argocd_gateway_class_name` | GatewayClass for the dedicated Gateway | `kgateway`   |
+| `argocd_gateway_annotations` | Service annotations for the dedicated Gateway's NLB | internet-facing NLB, `target-type: ip` |
+| `argocd_gateway_https_section_name` | Name of the TLS-fronted listener on the dedicated Gateway | `https` |
+| `argocd_gateway_tls_certificate_arn` | ACM certificate ARN; enables port 443 on the dedicated NLB | `""` (no TLS) |
+| `argocd_gateway_tls_port`  | Frontend port that terminates TLS      | `443`               |
+| `argocd_gateway_tls_negotiation_policy` | ELB security policy for that listener | `ELBSecurityPolicy-TLS13-1-2-2021-06` |
 
 Naming is derived in [locals.tf](locals.tf) as `<project_name>-<environment>`, e.g.
 `chamo-dev-vpc`, `chamo-dev-cluster`.
@@ -315,6 +405,14 @@ Naming is derived in [locals.tf](locals.tf) as `<project_name>-<environment>`, e
 - Terraform does not manage the `counter-api` Kubernetes manifests directly — only the
   Argo CD `Application`/`AppProject` pointing at [`deploy/helm/counter-api`](../../deploy/helm/counter-api);
   Argo CD syncs the chart from this repo on every push to `main`.
+- The Argo CD route is off by default, so nothing publishes the Argo CD UI unless you set
+  `enable_argocd_route = true`. Argo CD itself runs without TLS (`server.insecure = true`),
+  so publish it only behind the NLB's TLS port — an ACM certificate plus
+  `argocd_gateway_section_name = "https"` (reused Gateway) or
+  `argocd_gateway_tls_certificate_arn` (dedicated one). Port 80 stays open alongside 443;
+  nothing redirects it yet, so treat the HTTP port as reachable.
+- ACM certificates are regional: the one referenced here must live in `var.region`, the same
+  region as the cluster and its NLB, and cover the hostnames the HTTPRoutes match.
 - kgateway's public NLB is `internet-facing`; adjust
   [`../../deploy/argocd/kgateway/parameters.yaml`](../../deploy/argocd/kgateway/parameters.yaml)
   if an internal-only load balancer is required.
