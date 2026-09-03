@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------- Terraform
+# Provider binaries and downloaded modules: hundreds of MB, platform-specific,
+# and reproducible from .terraform.lock.hcl with `terraform init`.
+**/.terraform/*
+
+# .terraform.lock.hcl is deliberately NOT ignored -- it pins provider versions
+# and checksums, and must be committed.
+
+# State never belongs in git: it holds resource attributes in the clear. This
+# project keeps it in S3 (see infra/aws/providers.tf), so these only ever show
+# up from a local/legacy run.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Saved plans; they embed the full resource diff, secrets included.
+*.tfplan
+tfplan
+
+# Variable files: the usual place for account IDs, ARNs, and credentials.
+*.tfvars
+*.tfvars.json
+
+# Local overrides and CLI config
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+crash.log
+crash.*.log
+
+# ----------------------------------------------------------------------- Go
+# Compiled binaries -- `go build` drops one named after its directory, next to
+# the sources. Anchored to the exact paths: a bare `counter-api` pattern would
+# also match the apps/counter-api and deploy/helm/counter-api directories and
+# ignore the whole project.
+/apps/counter-api/counter-api
+/apps/counter-api/loadtest/loadgen/loadgen
+/apps/counter-api/loadtest/stub-origin/stub-origin
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test and coverage output
+*.test
+*.out
+coverage.html
+
+# Dependencies are resolved from go.mod/go.sum, not vendored
+vendor/
+
+# Go workspace files are per-developer
+go.work
+go.work.sum
+
+# ------------------------------------------------------- Kubernetes / Helm
+# Cluster credentials
+kubeconfig
+kubeconfig-*
+*.kubeconfig
+.kube/
+
+# Packaged charts and chart dependencies (deploy/helm/counter-api has no
+# subcharts today; this keeps `helm package`/`helm dep up` output out of git).
+*.tgz
+charts/
+Chart.lock
+
+# Local-only values overrides -- values.yaml itself is what Argo CD syncs and
+# stays tracked.
+values.local.yaml
+values-*.local.yaml
+
+# ------------------------------------------------------------ Editors / OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
