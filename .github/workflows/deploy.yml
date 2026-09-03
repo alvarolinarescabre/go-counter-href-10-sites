@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       port_run_id:
-        description: "Port Run ID"
+        description: "Port workflow run ID"
         required: true
         type: string
       service:
@@ -51,4 +51,3 @@ jobs:
             --auth-token $ARGOCD_AUTH_TOKEN \
             --grpc-web \
             --health
-            
