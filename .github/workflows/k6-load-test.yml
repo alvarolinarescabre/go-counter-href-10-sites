@@ -135,7 +135,7 @@ jobs:
 
       # ─── Actualizar entidad en Port con métricas ─────────────────────────────
       - name: Update Port entity with results
-        if: ${{ inputs.port_entity_id != '' }}
+        if: ${{ inputs.port_entity_id != '' && inputs.port_entity_id != 'null' }}
         run: |
           curl -sf -X PATCH \
             "https://api.getport.io/v1/blueprints/loadTestRun/entities/${{ inputs.port_entity_id }}" \
