@@ -24,7 +24,7 @@ env:
   PORT_BASE_URL: https://api.getport.io
   AWS_REGION: eu-west-1
   ECR_REPOSITORY: ${{ github.event.repository.name }}
-  GITOPS_REPO: alvarolinarescabre/gitops-manifests
+  GITOPS_REPO: alvarolinarescabre/go-counter-href-10-sites
   APP_NAME: ${{ github.event.repository.name }}
   ENVIRONMENT: dev
 
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write   # necesario para el OIDC de AWS
     steps:
       - name: Checkout application source
         uses: actions/checkout@v4
