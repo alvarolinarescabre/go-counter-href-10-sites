@@ -1,4 +1,4 @@
-replicaCount: 2
+replicaCount: 12
 revisionHistoryLimit: 2
 image:
   # Must match `terraform output ecr_repository_url` from infra/aws. Nodes pull
