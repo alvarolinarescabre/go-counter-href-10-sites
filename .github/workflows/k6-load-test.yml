@@ -82,6 +82,14 @@ jobs:
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
           echo "errors=$ERRORS" >> $GITHUB_OUTPUT
 
+      - name: Sanitize identifier
+        run: |
+          # Replace any invalid chars with hyphens, lowercase everything
+          SAFE_ID=$(echo "${{ env.APP_NAME }}-${{ github.run_id }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9@_.+:\\/='"'"'-]/-/g')
+          echo "ENTITY_ID=$SAFE_ID" >> $GITHUB_ENV
+
       - name: Update Port entity with results
         if: always() && inputs.port_entity_id != ''
         env:
