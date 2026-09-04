@@ -24,7 +24,7 @@ env:
   PORT_BASE_URL: https://api.getport.io
   AWS_REGION: eu-west-1
   ECR_REPOSITORY: ${{ github.event.repository.name }}
-  GITOPS_REPO: mi-org/gitops-manifests
+  GITOPS_REPO: alvarolinarescabre/gitops-manifests
   APP_NAME: ${{ github.event.repository.name }}
   ENVIRONMENT: dev
 
@@ -33,9 +33,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write   # necesario para el OIDC de AWS
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout application source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ref: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # ------------------------------------------------------------------
       # 1. Crear la entidad deployment en Port  ->  status: Building
