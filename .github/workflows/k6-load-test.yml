@@ -36,17 +36,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ─── Instalar k6 ────────────────────────────────────────────────────────
+      # ─── Instalar k6 (sin dirmngr / GPG keyserver) ──────────────────────────
       - name: Install k6
         run: |
-          sudo gpg --no-default-keyring \
-            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
-            --keyserver hkp://keyserver.ubuntu.com:80 \
-            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
-            | sudo tee /etc/apt/sources.list.d/k6.list
-          sudo apt-get update -q
-          sudo apt-get install -y k6
+          K6_VERSION="v0.54.0"
+          curl -sL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" \
+            -o /tmp/k6.tar.gz
+          tar -xzf /tmp/k6.tar.gz -C /tmp
+          sudo mv /tmp/k6-${K6_VERSION}-linux-amd64/k6 /usr/local/bin/k6
+          k6 version
 
       # ─── Script k6 inline ───────────────────────────────────────────────────
       - name: Create k6 test script
@@ -59,8 +57,8 @@ jobs:
             vus:      __ENV.VUS      ? parseInt(__ENV.VUS)  : 10,
             duration: __ENV.DURATION || '30s',
             thresholds: {
-              http_req_failed:   ['rate<0.10'],    // error rate < 10 %
-              http_req_duration: ['p(95)<2000'],   // p95 < 2 s
+              http_req_failed:   ['rate<0.10'],   // error rate < 10%
+              http_req_duration: ['p(95)<2000'],  // p95 < 2s
             },
           };
 
@@ -76,7 +74,7 @@ jobs:
       # ─── Ejecutar k6 ────────────────────────────────────────────────────────
       - name: Run k6 load test
         id: k6_run
-        continue-on-error: true   # no abortar; capturamos el exit code
+        continue-on-error: true
         run: |
           k6 run \
             --env VUS="${{ inputs.vus }}" \
@@ -92,28 +90,28 @@ jobs:
           SUMMARY=/tmp/k6-summary.json
 
           if [ ! -f "$SUMMARY" ]; then
-            echo "avg_response_time=0"  >> $GITHUB_OUTPUT
-            echo "p95_response_time=0"  >> $GITHUB_OUTPUT
-            echo "p99_response_time=0"  >> $GITHUB_OUTPUT
-            echo "rps=0"                >> $GITHUB_OUTPUT
-            echo "total_requests=0"     >> $GITHUB_OUTPUT
-            echo "error_rate=100"       >> $GITHUB_OUTPUT
+            echo "avg_response_time=0" >> $GITHUB_OUTPUT
+            echo "p95_response_time=0" >> $GITHUB_OUTPUT
+            echo "p99_response_time=0" >> $GITHUB_OUTPUT
+            echo "rps=0"               >> $GITHUB_OUTPUT
+            echo "total_requests=0"    >> $GITHUB_OUTPUT
+            echo "error_rate=100"      >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          AVG=$(jq '(.metrics.http_req_duration.values.avg           // 0) * 100 | round / 100' "$SUMMARY")
-          P95=$(jq '(.metrics.http_req_duration.values["p(95)"]      // 0) * 100 | round / 100' "$SUMMARY")
-          P99=$(jq '(.metrics.http_req_duration.values["p(99)"]      // 0) * 100 | round / 100' "$SUMMARY")
-          RPS=$(jq '(.metrics.http_reqs.values.rate                  // 0) * 100 | round / 100' "$SUMMARY")
-          TOTAL=$(jq  '(.metrics.http_reqs.values.count              // 0)'                      "$SUMMARY")
-          ERROR=$(jq '(.metrics.http_req_failed.values.rate          // 0) * 10000 | round / 100' "$SUMMARY")
+          AVG=$(jq   '(.metrics.http_req_duration.values.avg              // 0) * 100 | round / 100' "$SUMMARY")
+          P95=$(jq   '(.metrics.http_req_duration.values["p(95)"]         // 0) * 100 | round / 100' "$SUMMARY")
+          P99=$(jq   '(.metrics.http_req_duration.values["p(99)"]         // 0) * 100 | round / 100' "$SUMMARY")
+          RPS=$(jq   '(.metrics.http_reqs.values.rate                     // 0) * 100 | round / 100' "$SUMMARY")
+          TOTAL=$(jq '(.metrics.http_reqs.values.count                    // 0)'                      "$SUMMARY")
+          ERROR=$(jq '(.metrics.http_req_failed.values.rate               // 0) * 10000 | round / 100' "$SUMMARY")
 
-          echo "avg_response_time=$AVG"   >> $GITHUB_OUTPUT
-          echo "p95_response_time=$P95"   >> $GITHUB_OUTPUT
-          echo "p99_response_time=$P99"   >> $GITHUB_OUTPUT
-          echo "rps=$RPS"                 >> $GITHUB_OUTPUT
-          echo "total_requests=$TOTAL"    >> $GITHUB_OUTPUT
-          echo "error_rate=$ERROR"        >> $GITHUB_OUTPUT
+          echo "avg_response_time=$AVG"  >> $GITHUB_OUTPUT
+          echo "p95_response_time=$P95"  >> $GITHUB_OUTPUT
+          echo "p99_response_time=$P99"  >> $GITHUB_OUTPUT
+          echo "rps=$RPS"                >> $GITHUB_OUTPUT
+          echo "total_requests=$TOTAL"   >> $GITHUB_OUTPUT
+          echo "error_rate=$ERROR"       >> $GITHUB_OUTPUT
 
       # ─── Determinar estado ───────────────────────────────────────────────────
       - name: Determine test status
@@ -145,7 +143,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "properties": {
-                "status":                "${{ steps.test_status.outputs.status }}",
+                "status":               "${{ steps.test_status.outputs.status }}",
                 "avg_response_time_ms":  ${{ steps.parse_results.outputs.avg_response_time }},
                 "p95_response_time_ms":  ${{ steps.parse_results.outputs.p95_response_time }},
                 "p99_response_time_ms":  ${{ steps.parse_results.outputs.p99_response_time }},
