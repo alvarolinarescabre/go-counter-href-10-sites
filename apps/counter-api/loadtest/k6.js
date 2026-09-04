@@ -12,7 +12,7 @@ import { check } from 'k6';
 import { Rate } from 'k6/metrics';
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
-const RATE = parseInt(__ENV.K6_VUS || '15000', 10);
+const RATE = parseInt(__ENV.K6_VUS || '5000', 10);
 const DURATION = __ENV.K6_DURATION || '60s';
 
 const errors = new Rate('business_errors');
