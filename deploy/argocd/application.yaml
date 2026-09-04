@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: counter-api
+  name: go-counter-href-10-sites
   namespace: argocd
 spec:
   project: go-counter-href-10-sites-project
