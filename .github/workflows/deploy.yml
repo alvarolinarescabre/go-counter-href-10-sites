@@ -92,12 +92,14 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: apps/counter-api
+          file: apps/counter-api/Dockerfile
           push: true
           tags: ${{ env.IMAGE_REPO }}:${{ github.sha }}
           provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
 
       - name: Port | imagen publicada
         uses: port-labs/port-github-action@v1
