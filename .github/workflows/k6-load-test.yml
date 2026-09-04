@@ -138,7 +138,7 @@ jobs:
         if: ${{ inputs.port_entity_id != '' }}
         run: |
           curl -sf -X PATCH \
-            "https://api.getport.io/v1/blueprints/loadTestRun/entities/load-test-run-test-1" \
+            "https://api.getport.io/v1/blueprints/loadTestRun/entities/${{ inputs.port_entity_id }}" \
             -H "Authorization: Bearer ${{ steps.port_token.outputs.token }}" \
             -H "Content-Type: application/json" \
             -d '{
@@ -152,27 +152,6 @@ jobs:
                 "error_rate_percent":    ${{ steps.parse_results.outputs.error_rate }}
               }
             }'
-
-      # ─── Reportar estado al Port Run ─────────────────────────────────────────
-      - name: Report status to Port run
-        if: ${{ always() && inputs.port_run_id != '' }}
-        run: |
-          if [ "${{ steps.test_status.outputs.status }}" == "passed" ]; then
-            PORT_STATUS="SUCCESS"
-            MESSAGE="✅ Load test completado. Avg: ${{ steps.parse_results.outputs.avg_response_time }}ms | P95: ${{ steps.parse_results.outputs.p95_response_time }}ms | RPS: ${{ steps.parse_results.outputs.rps }} | Errors: ${{ steps.parse_results.outputs.error_rate }}%"
-          else
-            PORT_STATUS="FAILURE"
-            MESSAGE="❌ Load test falló. Avg: ${{ steps.parse_results.outputs.avg_response_time }}ms | P95: ${{ steps.parse_results.outputs.p95_response_time }}ms | RPS: ${{ steps.parse_results.outputs.rps }} | Errors: ${{ steps.parse_results.outputs.error_rate }}%"
-          fi
-
-          curl -sf -X PATCH \
-            "https://api.getport.io/v1/actions/runs/${{ inputs.port_run_id }}" \
-            -H "Authorization: Bearer ${{ steps.port_token.outputs.token }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"status\": \"$PORT_STATUS\",
-              \"message\": { \"run_status\": \"$MESSAGE\" }
-            }"
 
       # ─── Subir artefacto ─────────────────────────────────────────────────────
       - name: Upload k6 summary artifact
