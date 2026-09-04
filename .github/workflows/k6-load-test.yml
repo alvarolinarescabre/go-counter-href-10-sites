@@ -1,0 +1,54 @@
+name: k6 Load Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "URL objetivo del test"
+        required: true
+        type: string
+      vus:
+        description: "Número de usuarios virtuales"
+        required: true
+        default: "10"
+        type: string
+      duration:
+        description: "Duración del test (ej: 30s, 1m)"
+        required: true
+        default: "30s"
+        type: string
+      port_run_id:
+        description: "Run ID de Port para reportar status"
+        required: false
+        type: string
+
+jobs:
+  load-test:
+    name: Run k6 Load Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6 -y
+
+      - name: Run k6 test
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          K6_VUS: ${{ inputs.vus }}
+          K6_DURATION: ${{ inputs.duration }}
+        run: |
+          k6 run \
+            --vus "$K6_VUS" \
+            --duration "$K6_DURATION" \
+            -e TARGET_URL="$TARGET_URL" \
+            apps/counter-api/loadtest/k6.js
