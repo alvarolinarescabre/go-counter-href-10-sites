@@ -125,9 +125,7 @@ jobs:
           git clone --depth 1 \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITOPS_REPO}.git" gitops
           cd gitops
-          yq -i '.image.tag = "${{ github.sha }}"' "apps/${APP_NAME}/${ENVIRONMENT}/values.yaml"
+          yq -i '.image.tag = "${{ github.sha }}"' "deploy/helm/counter-api/values.yaml"
           git -c user.name="port-ci" -c user.email="ci@example.com" \
             commit -am "chore(${APP_NAME}): bump a ${{ github.sha }}"
           git push
-
-      # ... resto igual

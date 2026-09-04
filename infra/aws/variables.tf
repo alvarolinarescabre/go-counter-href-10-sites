@@ -195,9 +195,9 @@ variable "argocd_gateway_annotations" {
 
 
 variable "ecr_repository_name" {
-  description = "Name of the ECR repository holding the counter-api image. Must match the repository part of image.repository in the Helm values and of ECR_REPOSITORY in the deploy workflow."
+  description = "Name of the ECR repository holding the go-counter-href-10-sites image. Must match the repository part of image.repository in the Helm values and of ECR_REPOSITORY in the deploy workflow."
   type        = string
-  default     = "counter-api"
+  default     = "go-counter-href-10-sites"
 }
 
 variable "ecr_untagged_expiry_days" {
