@@ -138,7 +138,7 @@ jobs:
         if: ${{ inputs.port_entity_id != '' }}
         run: |
           curl -sf -X PATCH \
-            "https://api.getport.io/v1/blueprints/loadTestRun/entities/${{ inputs.port_entity_id }}" \
+            "https://api.getport.io/v1/blueprints/loadTestRun/entities/load-test-run-test-1" \
             -H "Authorization: Bearer ${{ steps.port_token.outputs.token }}" \
             -H "Content-Type: application/json" \
             -d '{
