@@ -29,7 +29,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
 
@@ -126,6 +126,6 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITOPS_REPO}.git" gitops
           cd gitops
           yq -i '.image.tag = "${{ github.sha }}"' "deploy/helm/counter-api/values.yaml"
-          git -c user.name="port-ci" -c user.email="ci@example.com" \
+          git -c user.name="alvarolinarescabre" -c user.email="alvarolinarescabre@gmail.com" \
             commit -am "chore(${APP_NAME}): bump a ${{ github.sha }}"
           git push
