@@ -72,7 +72,7 @@ type Analyzer struct {
 func loadConfig() Config {
 	urls := strings.Split(os.Getenv("TARGET_URLS"), ",")
 	if len(urls) == 1 && strings.TrimSpace(urls[0]) == "" {
-		urls = []string{"https://go.dev", "https://www.python.org", "https://www.realpython.com", "https://nodejs.org", "https://www.gatos.com", "https://www.gitlab.com", "https://aws.amazon.com", "https://www.mozilla.org", "https://www.github.com", "https://www.google.com"}
+		urls = []string{"https://go.dev", "https://www.python.org", "https://www.realpython.com", "https://nodejs.org", "https://www.port.io", "https://www.gitlab.com", "https://aws.amazon.com", "https://www.mozilla.org", "https://www.github.com", "https://www.google.com"}
 	}
 	for index := range urls {
 		urls[index] = strings.TrimSpace(urls[index])
