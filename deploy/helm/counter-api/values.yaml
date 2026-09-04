@@ -1,17 +1,14 @@
 replicaCount: 2
 revisionHistoryLimit: 2
-
 image:
   # Must match `terraform output ecr_repository_url` from infra/aws. Nodes pull
   # it with the EKS Auto Mode node IAM role, so there is no imagePullSecret.
   repository: 133630512259.dkr.ecr.eu-west-1.amazonaws.com/counter-api
-  tag: sha-0137852cbf6264e0afd34870e457d2bf588b846d
+  tag: 3243d076d965097215d3f1240d6fb8560d2650a2
   pullPolicy: IfNotPresent
-
 service:
   type: ClusterIP
   port: 80
-
 gateway:
   enabled: true
   name: public-nlb-gateway
@@ -28,7 +25,6 @@ gateway:
     enabled: true
     listenerName: https
     port: 443
-
 httpRoute:
   enabled: true
   gateway:
@@ -44,7 +40,6 @@ httpRoute:
   hostnames:
     - counter-api.alvarolinarescabre.com
   pathPrefix: /
-
 gatewayParameters:
   enabled: true
   name: public-nlb-params
@@ -62,7 +57,6 @@ gatewayParameters:
     # Frontend ports that terminate TLS. Everything else stays plain HTTP.
     ports: "443"
     negotiationPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
-
 resources:
   requests:
     cpu: 100m
