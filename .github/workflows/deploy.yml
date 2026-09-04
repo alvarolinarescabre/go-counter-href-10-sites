@@ -66,7 +66,7 @@ jobs:
           relations: |-
             {
               "service": "${{ github.event.repository.name }}",
-              "argocdApplication": "${{ github.event.repository.name }}-dev"
+              "argocdApplication": "${APP_NAME}"
             }
 
       # ------------------------------------------------------------------
