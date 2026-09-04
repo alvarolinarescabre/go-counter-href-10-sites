@@ -72,12 +72,12 @@ jobs:
       # ------------------------------------------------------------------
       # 2. Build + push de la imagen  ->  status: Image pushed
       # ------------------------------------------------------------------
-      - name: Configurar credenciales AWS (OIDC)
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: gha-${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
 
       - name: Login en ECR
         id: ecr
