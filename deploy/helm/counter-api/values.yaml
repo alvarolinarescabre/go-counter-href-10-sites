@@ -4,7 +4,7 @@ image:
   # Must match `terraform output ecr_repository_url` from infra/aws. Nodes pull
   # it with the EKS Auto Mode node IAM role, so there is no imagePullSecret.
   repository: 133630512259.dkr.ecr.eu-west-1.amazonaws.com/counter-api
-  tag: sha-d4e1f54dc747a607cae9a1f9bec4b416d1ba53f0
+  tag: sha-0ab63088a0709531392c0ea07ba977315a02d9e2
   pullPolicy: IfNotPresent
 
 service:
