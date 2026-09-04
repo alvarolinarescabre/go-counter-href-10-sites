@@ -1,28 +1,29 @@
+# .github/workflows/k6-load-test.yml
 name: k6 Load Test
 
 on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: "URL objetivo del test"
+        description: 'URL objetivo a testear'
         required: true
         type: string
       vus:
-        description: "Número de usuarios virtuales"
+        description: 'Usuarios virtuales (VUs)'
         required: true
-        default: "10"
+        default: '10'
         type: string
       duration:
-        description: "Duración del test (ej: 30s, 1m)"
+        description: 'Duración del test (ej: 30s, 1m, 5m)'
         required: true
-        default: "30s"
+        default: '30s'
         type: string
       port_run_id:
-        description: "Run ID de Port para reportar status"
+        description: 'Port Run ID para reportar estado'
         required: false
         type: string
       port_entity_id:
-        description: "ID de la entidad en Port para actualizar resultados"
+        description: 'Identificador de la entidad loadTestRun en Port'
         required: false
         type: string
 
@@ -35,87 +36,151 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ─── Instalar k6 ────────────────────────────────────────────────────────
       - name: Install k6
         run: |
-          sudo gpg -k
-          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
-            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
           echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
             | sudo tee /etc/apt/sources.list.d/k6.list
-          sudo apt-get update && sudo apt-get install k6 -y
+          sudo apt-get update -q
+          sudo apt-get install -y k6
 
-      - name: Run k6 test
-        id: k6
-        env:
-          TARGET_URL: ${{ inputs.target_url }}
-          K6_VUS: ${{ inputs.vus }}
-          K6_DURATION: ${{ inputs.duration }}
+      # ─── Script k6 inline ───────────────────────────────────────────────────
+      - name: Create k6 test script
+        run: |
+          cat > /tmp/load-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+
+          export const options = {
+            vus:      __ENV.VUS      ? parseInt(__ENV.VUS)  : 10,
+            duration: __ENV.DURATION || '30s',
+            thresholds: {
+              http_req_failed:   ['rate<0.10'],    // error rate < 10 %
+              http_req_duration: ['p(95)<2000'],   // p95 < 2 s
+            },
+          };
+
+          export default function () {
+            const res = http.get(__ENV.TARGET_URL);
+            check(res, {
+              'status is 2xx': (r) => r.status >= 200 && r.status < 300,
+            });
+            sleep(1);
+          }
+          EOF
+
+      # ─── Ejecutar k6 ────────────────────────────────────────────────────────
+      - name: Run k6 load test
+        id: k6_run
+        continue-on-error: true   # no abortar; capturamos el exit code
         run: |
           k6 run \
-            --vus "$K6_VUS" \
-            --duration "$K6_DURATION" \
-            -e TARGET_URL="$TARGET_URL" \
-            --summary-export=results.json \
-            apps/counter-api/loadtest/k6.js
-          echo "k6_exit=$?" >> $GITHUB_OUTPUT
+            --env VUS="${{ inputs.vus }}" \
+            --env DURATION="${{ inputs.duration }}" \
+            --env TARGET_URL="${{ inputs.target_url }}" \
+            --summary-export=/tmp/k6-summary.json \
+            /tmp/load-test.js
 
+      # ─── Parsear métricas ────────────────────────────────────────────────────
       - name: Parse k6 results
-        id: parse
-        if: always()
+        id: parse_results
         run: |
-          # Extraer métricas del summary de k6
-          AVG=$(jq '.metrics["http_req_duration"].values.avg // 0' results.json)
-          P95=$(jq '.metrics["http_req_duration"].values["p(95)"] // 0' results.json)
-          P99=$(jq '.metrics["http_req_duration"].values["p(99)"] // 0' results.json)
-          RPS=$(jq '.metrics["http_reqs"].values.rate // 0' results.json)
-          TOTAL=$(jq '.metrics["http_reqs"].values.count // 0' results.json)
-          ERRORS=$(jq '
-            if .metrics["http_req_failed"].values.rate then
-              (.metrics["http_req_failed"].values.rate * 100 | round)
-            else 0 end
-          ' results.json)
+          SUMMARY=/tmp/k6-summary.json
 
-          echo "avg_ms=$AVG" >> $GITHUB_OUTPUT
-          echo "p95_ms=$P95" >> $GITHUB_OUTPUT
-          echo "p99_ms=$P99" >> $GITHUB_OUTPUT
-          echo "rps=$RPS" >> $GITHUB_OUTPUT
-          echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          echo "errors=$ERRORS" >> $GITHUB_OUTPUT
+          if [ ! -f "$SUMMARY" ]; then
+            echo "avg_response_time=0"  >> $GITHUB_OUTPUT
+            echo "p95_response_time=0"  >> $GITHUB_OUTPUT
+            echo "p99_response_time=0"  >> $GITHUB_OUTPUT
+            echo "rps=0"                >> $GITHUB_OUTPUT
+            echo "total_requests=0"     >> $GITHUB_OUTPUT
+            echo "error_rate=100"       >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-      - name: Sanitize identifier
+          AVG=$(jq '(.metrics.http_req_duration.values.avg           // 0) * 100 | round / 100' "$SUMMARY")
+          P95=$(jq '(.metrics.http_req_duration.values["p(95)"]      // 0) * 100 | round / 100' "$SUMMARY")
+          P99=$(jq '(.metrics.http_req_duration.values["p(99)"]      // 0) * 100 | round / 100' "$SUMMARY")
+          RPS=$(jq '(.metrics.http_reqs.values.rate                  // 0) * 100 | round / 100' "$SUMMARY")
+          TOTAL=$(jq  '(.metrics.http_reqs.values.count              // 0)'                      "$SUMMARY")
+          ERROR=$(jq '(.metrics.http_req_failed.values.rate          // 0) * 10000 | round / 100' "$SUMMARY")
+
+          echo "avg_response_time=$AVG"   >> $GITHUB_OUTPUT
+          echo "p95_response_time=$P95"   >> $GITHUB_OUTPUT
+          echo "p99_response_time=$P99"   >> $GITHUB_OUTPUT
+          echo "rps=$RPS"                 >> $GITHUB_OUTPUT
+          echo "total_requests=$TOTAL"    >> $GITHUB_OUTPUT
+          echo "error_rate=$ERROR"        >> $GITHUB_OUTPUT
+
+      # ─── Determinar estado ───────────────────────────────────────────────────
+      - name: Determine test status
+        id: test_status
         run: |
-          # Replace any invalid chars with hyphens, lowercase everything
-          SAFE_ID=$(echo "${{ env.APP_NAME }}-${{ github.run_id }}" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's/[^a-z0-9@_.+:\\/='"'"'-]/-/g')
-          echo "ENTITY_ID=$SAFE_ID" >> $GITHUB_ENV
+          if [ "${{ steps.k6_run.outcome }}" == "success" ]; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Update Port entity with results
-        if: always() && inputs.port_entity_id != ''
-        env:
-          PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
-          PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+      # ─── Token de Port ───────────────────────────────────────────────────────
+      - name: Get Port access token
+        id: port_token
         run: |
-          # Obtener token de Port
-          TOKEN=$(curl -s -X POST https://api.getport.io/v1/auth/access_token \
+          TOKEN=$(curl -sf -X POST https://api.getport.io/v1/auth/access_token \
             -H "Content-Type: application/json" \
-            -d "{\"clientId\": \"$PORT_CLIENT_ID\", \"clientSecret\": \"$PORT_CLIENT_SECRET\"}" \
+            -d "{\"clientId\":\"${{ secrets.PORT_CLIENT_ID }}\",\"clientSecret\":\"${{ secrets.PORT_CLIENT_SECRET }}\"}" \
             | jq -r '.accessToken')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
-          STATUS="${{ steps.k6.outputs.k6_exit == '0' && 'passed' || 'failed' }}"
-
-          # Actualizar entidad en Port con los resultados
-          curl -s -X PATCH "https://api.getport.io/v1/blueprints/loadTestRun/entities/${{ inputs.port_entity_id }}" \
-            -H "Authorization: Bearer $TOKEN" \
+      # ─── Actualizar entidad en Port con métricas ─────────────────────────────
+      - name: Update Port entity with results
+        if: ${{ inputs.port_entity_id != '' }}
+        run: |
+          curl -sf -X PATCH \
+            "https://api.getport.io/v1/blueprints/loadTestRun/entities/${{ inputs.port_entity_id }}" \
+            -H "Authorization: Bearer ${{ steps.port_token.outputs.token }}" \
             -H "Content-Type: application/json" \
             -d '{
               "properties": {
-                "status": "'"$STATUS"'",
-                "avg_response_time_ms": ${{ steps.parse.outputs.avg_ms }},
-                "p95_response_time_ms": ${{ steps.parse.outputs.p95_ms }},
-                "p99_response_time_ms": ${{ steps.parse.outputs.p99_ms }},
-                "requests_per_second": ${{ steps.parse.outputs.rps }},
-                "total_requests": ${{ steps.parse.outputs.total }},
-                "error_rate_percent": ${{ steps.parse.outputs.errors }}
+                "status":                "${{ steps.test_status.outputs.status }}",
+                "avg_response_time_ms":  ${{ steps.parse_results.outputs.avg_response_time }},
+                "p95_response_time_ms":  ${{ steps.parse_results.outputs.p95_response_time }},
+                "p99_response_time_ms":  ${{ steps.parse_results.outputs.p99_response_time }},
+                "requests_per_second":   ${{ steps.parse_results.outputs.rps }},
+                "total_requests":        ${{ steps.parse_results.outputs.total_requests }},
+                "error_rate_percent":    ${{ steps.parse_results.outputs.error_rate }}
               }
             }'
+
+      # ─── Reportar estado al Port Run ─────────────────────────────────────────
+      - name: Report status to Port run
+        if: ${{ always() && inputs.port_run_id != '' }}
+        run: |
+          if [ "${{ steps.test_status.outputs.status }}" == "passed" ]; then
+            PORT_STATUS="SUCCESS"
+            MESSAGE="✅ Load test completado. Avg: ${{ steps.parse_results.outputs.avg_response_time }}ms | P95: ${{ steps.parse_results.outputs.p95_response_time }}ms | RPS: ${{ steps.parse_results.outputs.rps }} | Errors: ${{ steps.parse_results.outputs.error_rate }}%"
+          else
+            PORT_STATUS="FAILURE"
+            MESSAGE="❌ Load test falló. Avg: ${{ steps.parse_results.outputs.avg_response_time }}ms | P95: ${{ steps.parse_results.outputs.p95_response_time }}ms | RPS: ${{ steps.parse_results.outputs.rps }} | Errors: ${{ steps.parse_results.outputs.error_rate }}%"
+          fi
+
+          curl -sf -X PATCH \
+            "https://api.getport.io/v1/actions/runs/${{ inputs.port_run_id }}" \
+            -H "Authorization: Bearer ${{ steps.port_token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"status\": \"$PORT_STATUS\",
+              \"message\": { \"run_status\": \"$MESSAGE\" }
+            }"
+
+      # ─── Subir artefacto ─────────────────────────────────────────────────────
+      - name: Upload k6 summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-results-${{ github.run_id }}
+          path: /tmp/k6-summary.json
+          if-no-files-found: warn
