@@ -58,6 +58,17 @@ go install github.com/tsenart/vegeta/v12@latest   # if not installed
 RATE=5000 DURATION=60s BASE_URL=http://localhost:8080 ./loadtest/vegeta.sh
 ```
 
+## 3d. …or inside EKS, against the deployed environment
+
+```bash
+./loadtest/k8s/run.sh                                   # 1000/2500/5000 rps, 2m each
+STEPS="5000 10000" STEP_DURATION=3m ./loadtest/k8s/run.sh
+```
+
+Runs `loadgen` as a Job on a Karpenter node, away from the app and its gateway,
+against the public URL. See the "Load test" section of the
+[root README](../../../README.md#load-test) for options and reference results.
+
 ## 4. In-process micro-benchmarks (no network, no OS sockets)
 
 ```bash
@@ -77,6 +88,7 @@ handler, is the ceiling.
 | `HTTP_TIMEOUT_SECONDS` | `10` | per outbound fetch (refresh path only) |
 | `TARGET_URLS` | 10 built-in sites | comma-separated |
 | `PORT` | `8080` | |
+| `METRICS_PORT` | `9090` | Prometheus `/metrics`, kept off the API port |
 
 ## Watching the server under load
 

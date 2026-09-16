@@ -13,6 +13,10 @@ The repository also contains the entire AWS execution platform:
 - Helm to package the `counter-api` deployment.
 - GitHub Actions to build the image, publish it to ECR, and update the tag
   that Argo CD synchronizes.
+- VictoriaMetrics + Grafana for cluster and application metrics.
+- Horizontal Pod Autoscalers for the application and its gateway proxy, with
+  zero-downtime rollouts.
+- An in-cluster load test that exercises the public path (NLB -> gateway -> app).
 
 ## Architecture and deployment flow
 
@@ -26,10 +30,15 @@ GitHub Actions -- build Docker -- push ECR -- update values.yaml
 Git Repository <- Argo CD <- Application <- Helm chart
                                       |
                                       v
-                         Deployment + Service + Gateway + HTTPRoute
+                   Deployment + HPA + Service + Gateway + HTTPRoute
                                       |
                                       v
-                              AWS NLB -> counter-api
+                AWS NLB -> kgateway proxy (HPA) -> counter-api (HPA)
+                                                        |
+                                                  :9090/metrics
+                                                        |
+                                                        v
+                            vmagent -> VMSingle (EBS gp3) <- Grafana
 ```
 
 Terraform is used to create the platform and hand control to Argo CD.
@@ -41,9 +50,11 @@ and applies its changes automatically.
 
 ```text
 apps/counter-api/              Go code, tests, Swagger, and Dockerfile
+apps/counter-api/loadtest/     Load generators, stub origin, in-cluster Job
 deploy/helm/counter-api/       Helm chart for the application
 deploy/argocd/                 Application, AppProject, and kgateway
-infra/aws/                     Terraform for AWS/EKS
+deploy/monitoring/dashboards/  Grafana dashboards shipped by Terraform
+infra/aws/                     Terraform for AWS/EKS (11-monitoring.tf: metrics)
 infra/aws/bootstrap/           Initial IAM for GitHub Actions
 .github/workflows/deploy.yml   Build, push to ECR, and GitOps promotion
 ```
@@ -52,7 +63,7 @@ infra/aws/bootstrap/           Initial IAM for GitHub Actions
 
 To run the application locally:
 
-- Go 1.24 or newer.
+- Go 1.25 or newer.
 - Docker, if you want to build the image locally.
 
 To deploy on AWS:
@@ -82,6 +93,7 @@ The server listens on `http://localhost:8080`. Available variables:
 | Variable | Default | Description |
 |---|---:|---|
 | `PORT` | `8080` | Server HTTP port |
+| `METRICS_PORT` | `9090` | Port serving Prometheus metrics at `/metrics` |
 | `TARGET_URLS` | 10 predefined sites | Comma-separated URLs |
 | `HTTP_TIMEOUT_SECONDS` | `10` | Timeout for each fetch |
 | `REFRESH_INTERVAL_SECONDS` | `60` | Cache refresh interval |
@@ -115,6 +127,10 @@ go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g main.go -o docs
 | `GET /v1/cache/clear` | Force an out-of-band refresh |
 | `GET /docs` | Redirect to Swagger UI |
 | `GET /swagger/index.html` | Swagger UI |
+| `GET :9090/metrics` | Prometheus metrics, on a separate port |
+
+Metrics live on their own port on purpose: the HTTPRoute only targets the API
+port, so `/metrics` is never reachable through the public Gateway.
 
 ## AWS deployment, step by step
 
@@ -240,7 +256,8 @@ terraform plan -out=tfplan
 
 Especially review region, CIDRs, names, and certificate ARN. The plan includes
 VPC, subnets, NAT Gateway, EKS, node group, Karpenter, AWS Load Balancer
-Controller, Argo CD, Gateway API, kgateway, and ECR.
+Controller, Argo CD, Gateway API, kgateway, ECR, the EBS CSI driver and
+metrics-server addons, and the monitoring stack (VictoriaMetrics + Grafana).
 
 ### 6. Create the infrastructure
 
@@ -365,6 +382,114 @@ kubectl get gateway -n argocd
 Argo CD is configured in `insecure` mode: TLS must terminate at the NLB, not at
 the pod.
 
+### 12. Access Grafana
+
+```bash
+terraform -chdir=infra/aws output -raw instructions   # "Monitoring" section
+
+# NLB hostname of the Grafana Gateway; point grafana_hostname at it (CNAME)
+kubectl -n monitoring get svc grafana-gateway \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{"\n"}'
+
+# admin password
+kubectl -n monitoring get secret victoria-metrics-k8s-stack-grafana \
+  -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+
+Open `http://<grafana_hostname>` with user `admin`. Without DNS, use
+`kubectl -n monitoring port-forward svc/victoria-metrics-k8s-stack-grafana 3000:80`
+and open `http://localhost:3000`. See [Monitoring](#monitoring) for details.
+
+## Monitoring
+
+Terraform ([`infra/aws/11-monitoring.tf`](infra/aws/11-monitoring.tf)) installs
+[victoria-metrics-k8s-stack](https://docs.victoriametrics.com/helm/victoria-metrics-k8s-stack/)
+as an Argo CD `Application` in the `monitoring` namespace.
+
+| Component | Role |
+|---|---|
+| VictoriaMetrics operator | Turns `VMServiceScrape`/`VMNodeScrape` objects into scrape config |
+| vmagent | Scrapes kubelet/cAdvisor, node-exporter, kube-state-metrics, CoreDNS, the API server, and `counter-api` |
+| VMSingle | Stores samples on an encrypted EBS gp3 volume (`monitoring_retention`, `monitoring_storage_size`) |
+| Grafana | Dashboards, 5Gi gp3 volume, published through its own Gateway/NLB (plain HTTP) |
+
+Alertmanager and vmalert are disabled because no notification receivers are
+configured yet; the alerting rules are still created. Controller-manager,
+scheduler, and etcd are not scraped: EKS does not expose them.
+
+Two prerequisites are part of the same Terraform:
+
+- **EBS CSI driver addon** plus a default `gp3` StorageClass. Without EKS Auto
+  Mode nothing else can provision the persistent volumes.
+- **metrics-server addon**, needed by every HorizontalPodAutoscaler.
+
+### Application metrics
+
+`counter-api` exposes these series on `:9090/metrics`, together with the Go
+runtime and process collectors:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `counter_api_http_requests_total` | counter | `method`, `route`, `status` |
+| `counter_api_http_request_duration_seconds` | histogram (50µs–1s) | `method`, `route` |
+| `counter_api_refreshes_total` | counter | `result` (`completed`, `skipped`) |
+| `counter_api_refresh_duration_seconds` | histogram | – |
+| `counter_api_last_refresh_timestamp_seconds` | gauge | – |
+| `counter_api_url_link_words` | gauge | `url` |
+| `counter_api_url_fetch_duration_seconds` | gauge | `url` |
+
+`route` is the Gin route template (`/v1/tags/:url_id`), not the raw path, so
+the number of series stays bounded.
+
+The chart creates a `VMServiceScrape` for the `metrics` Service port. It is only
+rendered when the `operator.victoriametrics.com` CRDs exist, so the application
+still syncs on a cluster without the monitoring stack. Toggle it with
+`metrics.enabled` and `metrics.serviceScrape.enabled` in `values.yaml`.
+
+### Dashboards
+
+- **counter-api**
+  ([`deploy/monitoring/dashboards/counter-api.json`](deploy/monitoring/dashboards/counter-api.json)):
+  request rate, 5xx ratio, latency percentiles per route, refresh health, link
+  words and fetch time per URL, and CPU/memory/goroutines per pod. Terraform
+  ships it as a ConfigMap that the Grafana sidecar loads.
+- The default Kubernetes dashboards that come with the chart (nodes, pods,
+  workloads, API server, CoreDNS).
+
+Check scrape targets directly in vmagent:
+
+```bash
+kubectl -n monitoring port-forward svc/vmagent-victoria-metrics-k8s-stack 8429
+# open http://localhost:8429/targets
+```
+
+## Autoscaling and zero-downtime rollouts
+
+The Helm chart configures both the application and the kgateway proxy that
+fronts it:
+
+| | `counter-api` | Gateway proxy (Envoy) |
+|---|---|---|
+| Autoscaling | HPA 3–24 pods, 70% CPU | HPA 2–6 replicas, 50% CPU (created by kgateway from `GatewayParameters`) |
+| Disruption budget | `maxUnavailable: 25%` | `minAvailable: 1` |
+| Shutdown | `preStop` sleep 10s, then graceful HTTP shutdown | Envoy graceful drain 10s |
+| Placement | Anywhere | Karpenter nodes only, spread across nodes |
+
+- The Deployment uses `maxUnavailable: 0`, so new pods are Ready before old
+  ones are removed.
+- The `preStop` sleep keeps a terminating pod serving until the proxy has
+  stopped routing to it; without it, every rollout produced 503s.
+- The Deployment renders no `spec.replicas` while autoscaling is on. The Argo CD
+  `Application` ignores `/spec/replicas` (`RespectIgnoreDifferences=true`), so a
+  sync never resets the replica count chosen by the HPA.
+- The proxy runs on Karpenter capacity because the managed system nodes are
+  burstable `t3.medium`. Karpenter itself is limited to the `c`, `m`, and `r`
+  families for the same reason.
+
+All of this is configurable under `rollout`, `podDisruptionBudget`,
+`autoscaling`, and `gatewayParameters.proxy` in
+[`values.yaml`](deploy/helm/counter-api/values.yaml).
+
 ## Automatic deployment with GitHub Actions
 
 The workflow [`deploy.yml`](.github/workflows/deploy.yml) runs on push to `main`
@@ -400,15 +525,89 @@ curl http://localhost:8080/healthcheck
 
 ## Load test
 
-The [`apps/counter-api/loadtest`](apps/counter-api/loadtest) folder includes k6
-scenarios, Vegeta, a deterministic origin, and hot-path benchmarks. Consult its
-README before running load against a public environment.
+The [`apps/counter-api/loadtest`](apps/counter-api/loadtest) folder includes:
+
+- `loadgen`: a dependency-free, open-model (constant arrival rate) generator.
+- k6 and Vegeta scripts.
+- A deterministic stub origin and hot-path benchmarks for local runs.
+- `k8s/`: a Job that runs `loadgen` inside EKS.
+
+Its [README](apps/counter-api/loadtest/README.md) covers local runs.
+
+### Run it inside EKS
+
+Run load against the environment from inside AWS. From a home connection, the
+uplink saturates first: in this project, it capped a laptop at ~2,300 rps with a
+420 ms p50, while the cluster was almost idle.
+
+```bash
+apps/counter-api/loadtest/k8s/run.sh
+```
+
+The script:
+
+1. Creates the `loadtest` namespace.
+2. Mounts `loadgen/main.go` as a ConfigMap, so no image has to be built.
+3. Starts a Job that compiles it and attacks the public URL in steps.
+4. Streams the report.
+
+The pod requests 3 CPUs, only runs on Karpenter nodes, and never shares a node
+with the application or the gateway, so it does not steal CPU from what it
+measures.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TARGET_URL` | `http://counter-api.alvarolinarescabre.com` | Base URL; `http://counter-api.counter-api.svc` skips the NLB and gateway |
+| `STEPS` | `1000 2500 5000` | Requests per second for each step |
+| `STEP_DURATION` | `2m` | Duration of each step |
+| `WORKERS` | `1024` | Maximum in-flight requests |
+
+```bash
+STEPS="5000 10000 20000" STEP_DURATION=3m apps/counter-api/loadtest/k8s/run.sh
+```
+
+For each step, the report shows scheduled vs. completed requests, `dropped`,
+the count of errors and each status code, and latency percentiles:
+
+- `dropped` means the generator could not keep up with the schedule: the target
+  was too slow, or there were too few workers.
+- `loadgen` exits non-zero if anything was dropped or returned non-200.
+
+Watch the **counter-api** Grafana dashboard during the run. Server-side latency
+and pod/proxy CPU there tell you whether latency comes from the app, the
+gateway, or the network.
+
+Clean up afterwards; Karpenter then removes the empty node:
+
+```bash
+kubectl delete namespace loadtest
+```
+
+### Reference results
+
+All results below come from the same test: `/v1/tags` plus 10% `/v1/tags/{id}`,
+1000 → 2500 → 5000 rps, 2 minutes per step.
+
+| Setup | 5000 rps achieved | Errors | p50 | p95 | p99 |
+|---|---|---|---|---|---|
+| From a laptop | 2,297 rps | 226 × 503 | 428 ms | 494 ms | 595 ms |
+| In EKS, 12 fixed pods, 1 proxy | 5000 | 93 × 503 (rollout during the step) | 1.6 ms | 2.6 ms | 9.7 ms |
+| In EKS, HPAs + zero-downtime rollouts | 5000 | 0 | 1.9 ms | 12.7 ms | 72.6 ms |
+
+- **Application:** server-side latency (from the app's own histogram) stayed at
+  p50 ≈ 25 µs and p99 ≈ 75 µs, using about 0.1 CPU per pod at 5000 rps.
+- **Gateway:** the Envoy proxy is the busiest component, at ~0.85 CPU per 5000
+  rps.
+- **Third run:** its tail latency came from proxy replicas scheduled on the
+  burstable system nodes, which is why the proxy is now pinned to Karpenter
+  capacity.
 
 ## Change application configuration
 
 Edit [`deploy/helm/counter-api/values.yaml`](deploy/helm/counter-api/values.yaml)
-to change replicas, resources, hostname, listeners, or certificate. Validate the
-chart before pushing:
+to change autoscaling limits, resources, rollout settings, hostname, listeners,
+or certificate. `replicaCount` is only used when `autoscaling.enabled` is
+`false`. Validate the chart before pushing:
 
 ```bash
 helm lint deploy/helm/counter-api
@@ -431,6 +630,8 @@ terraform destroy
 
 The remote Terraform bucket and its versions are not part of this stack and
 should be deleted separately only if you no longer need the state history.
+The VictoriaMetrics and Grafana EBS volumes use `reclaimPolicy: Delete` and are
+removed with the cluster, together with all stored metrics.
 
 ## Troubleshooting
 
@@ -460,6 +661,19 @@ match `httpRoute.hostnames`; check that `HTTPRoute` is `Accepted=True` and
 kubectl get application -n argocd
 kubectl describe application go-counter-href-10-sites -n argocd
 ```
+
+**A Grafana dashboard shows "No Data".** Check that the target is `up` in vmagent
+(`http://localhost:8429/targets`, see [Monitoring](#monitoring)) and that the
+`VMServiceScrape` exists (`kubectl -n counter-api get vmservicescrape`). Changes
+under `apps/` and `deploy/helm/` only reach the cluster after they are pushed to
+`main`, CI has built the image, and Argo CD has synced.
+
+**An HPA shows `cpu: <unknown>`.** metrics-server is missing or not ready, or
+the target pods have no CPU request. Check `kubectl top pods -n counter-api`.
+
+**Argo CD fails with `.status.terminatingReplicas: field not declared in
+schema`.** The Argo CD version is older than the cluster's Kubernetes version.
+Raise `argocd_chart_version` (Argo CD 3.x for Kubernetes ≥ 1.33).
 
 **Terraform cannot find the SSO role.** First assign the permission set to the
 AWS account and verify that the `AWSReservedSSO_*` role exists; then re-run
