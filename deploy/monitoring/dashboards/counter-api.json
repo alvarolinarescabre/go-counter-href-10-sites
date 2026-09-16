@@ -1,0 +1,517 @@
+{
+  "uid": "counter-api",
+  "title": "counter-api",
+  "tags": [
+    "counter-api"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "VictoriaMetrics"
+        },
+        "query": {
+          "query": "label_values(kube_deployment_created{deployment=\"counter-api\"}, namespace)",
+          "refId": "ns"
+        },
+        "definition": "label_values(kube_deployment_created{deployment=\"counter-api\"}, namespace)",
+        "current": {
+          "text": "counter-api",
+          "value": "counter-api"
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Requests/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "sum(rate(counter_api_http_requests_total{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval]))",
+          "legendFormat": "rps"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "5xx ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "sum(rate(counter_api_http_requests_total{namespace=\"$namespace\", job=\"counter-api\", status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(counter_api_http_requests_total{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "5xx"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "p99 latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(counter_api_http_request_duration_seconds_bucket{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Pods up",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "sum(up{namespace=\"$namespace\", job=\"counter-api\"})",
+          "legendFormat": "up"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Requests/s by route and status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "sum(rate(counter_api_http_requests_total{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])) by (route, status)",
+          "legendFormat": "{{route}} {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Latency by route (p50 / p95 / p99)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(counter_api_http_request_duration_seconds_bucket{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])) by (le, route))",
+          "legendFormat": "p50 {{route}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(counter_api_http_request_duration_seconds_bucket{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])) by (le, route))",
+          "legendFormat": "p95 {{route}}"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(counter_api_http_request_duration_seconds_bucket{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])) by (le, route))",
+          "legendFormat": "p99 {{route}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Refresh duration (p95) and seconds since last refresh",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(counter_api_refresh_duration_seconds_bucket{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])) by (le))",
+          "legendFormat": "refresh p95"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "time() - max(counter_api_last_refresh_timestamp_seconds{namespace=\"$namespace\", job=\"counter-api\"})",
+          "legendFormat": "since last refresh"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Refreshes/min by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "sum(rate(counter_api_refreshes_total{namespace=\"$namespace\", job=\"counter-api\"}[$__rate_interval])) by (result) * 60",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Link words per URL",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "max(counter_api_url_link_words{namespace=\"$namespace\", job=\"counter-api\"}) by (url)",
+          "legendFormat": "{{url}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Fetch duration per URL",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "max(counter_api_url_fetch_duration_seconds{namespace=\"$namespace\", job=\"counter-api\"}) by (url)",
+          "legendFormat": "{{url}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "CPU by pod",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", container=\"counter-api\"}[$__rate_interval])) by (pod)",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Memory (working set) by pod",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 28,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "sum(container_memory_working_set_bytes{namespace=\"$namespace\", container=\"counter-api\"}) by (pod)",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Goroutines by pod",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "VictoriaMetrics"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 28,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "VictoriaMetrics"
+          },
+          "expr": "go_goroutines{namespace=\"$namespace\", job=\"counter-api\"}",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    }
+  ]
+}

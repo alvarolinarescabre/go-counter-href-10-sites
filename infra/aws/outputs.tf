@@ -66,7 +66,7 @@ ${var.break_glass_role_enabled ? join("\n", [
   "    aws iam detach-user-policy --user-name <them> --policy-arn ${aws_iam_policy.break_glass[0].arn}",
   "",
   "  Every assume-role on it is in CloudTrail under the human's own identity -- review them afterwards.",
-]) : "  Disabled (break_glass_role_enabled = false). If Identity Center is unavailable, the only remaining admins are var.additional_cluster_admin_arns and whichever principal ran terraform apply."}
+  ]) : "  Disabled (break_glass_role_enabled = false). If Identity Center is unavailable, the only remaining admins are var.additional_cluster_admin_arns and whichever principal ran terraform apply."}
 
 
 Cluster Compute:
@@ -87,6 +87,16 @@ That exact string must be image.repository in deploy/helm/counter-api/values.yam
 Go Hit 10 App:
 --------------
 After deploy on ArgoCD, Run this command: 'kubectl get httproutes.gateway.networking.k8s.io -n counter-api' and uses the HOSTNAMES from 'counter-api' and uses it on you hosts file with your NLB address.
+
+
+Monitoring (VictoriaMetrics + Grafana):
+---------------------------------------
+${var.enable_monitoring ? join("\n", [
+  "Sync status: 'kubectl -n ${var.argocd_namespace} get application victoria-metrics-k8s-stack'",
+  var.enable_grafana_route ? "Grafana address: 'kubectl -n ${var.monitoring_namespace} get svc ${local.grafana_gateway_name} -o jsonpath=\"{.status.loadBalancer.ingress[0].hostname}\"'${var.grafana_hostname == "" ? "" : ", then point '${var.grafana_hostname}' at it and open 'http://${var.grafana_hostname}'"}" : "Grafana: 'kubectl -n ${var.monitoring_namespace} port-forward svc/victoria-metrics-k8s-stack-grafana 3000:80', then open 'http://localhost:3000'",
+  "User 'admin', password: 'kubectl -n ${var.monitoring_namespace} get secret victoria-metrics-k8s-stack-grafana -o jsonpath=\"{.data.admin-password}\" | base64 -d'",
+  "Scrape targets: 'kubectl -n ${var.monitoring_namespace} port-forward svc/vmagent-victoria-metrics-k8s-stack 8429', then open 'http://localhost:8429/targets'",
+]) : "  Disabled (enable_monitoring = false)."}
 
 
 To Destroy:

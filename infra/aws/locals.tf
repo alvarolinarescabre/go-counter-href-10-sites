@@ -130,4 +130,74 @@ locals {
 
   # My Public IP
   my_ip = "${chomp(data.http.my_ip.response_body)}/32"
+
+  # Monitoring (11-monitoring.tf)
+  grafana_gateway_name = "grafana-gateway"
+
+  victoria_metrics_k8s_stack_values = {
+    victoria-metrics-operator = {
+      # The webhook's certificate is generated with genCA on every chart
+      # render, which Argo CD would see as permanent drift.
+      admissionWebhooks = { enabled = false }
+    }
+
+    vmsingle = {
+      spec = {
+        retentionPeriod = var.monitoring_retention
+        storage = {
+          storageClassName = "gp3"
+          accessModes      = ["ReadWriteOnce"]
+          resources        = { requests = { storage = var.monitoring_storage_size } }
+        }
+      }
+    }
+
+    # No notification receivers are configured yet, so an Alertmanager and a
+    # rule evaluator would only use capacity. The recording/alerting rules are
+    # still created and can be turned on later.
+    alertmanager = { enabled = false }
+    vmalert      = { enabled = false }
+
+    # EKS runs the control plane outside the cluster: these endpoints do not
+    # exist, and scraping them only produces permanently-down targets.
+    kubeControllerManager = { enabled = false }
+    kubeScheduler         = { enabled = false }
+    kubeEtcd              = { enabled = false }
+
+    # A DaemonSet pod has to fit on every node, including the system nodes that
+    # are already at their max-pods limit; the priority lets it preempt.
+    prometheus-node-exporter = {
+      priorityClassName = "system-node-critical"
+    }
+
+    grafana = {
+      # The RWO volume cannot be attached to the old and new pod at once.
+      deploymentStrategy = { type = "Recreate" }
+      persistence = {
+        enabled          = true
+        type             = "pvc"
+        storageClassName = "gp3"
+        size             = "5Gi"
+      }
+      "grafana.ini" = {
+        server = {
+          root_url = var.grafana_hostname == "" ? "%(protocol)s://%(domain)s:%(http_port)s/" : "http://${var.grafana_hostname}/"
+        }
+      }
+      route = {
+        main = {
+          enabled   = var.enable_grafana_route
+          hostnames = var.grafana_hostname == "" ? [] : [var.grafana_hostname]
+          # group/kind spelled out: the API server defaults them, and leaving
+          # them implicit makes Argo CD report the route as OutOfSync forever.
+          parentRefs = [{
+            group       = "gateway.networking.k8s.io"
+            kind        = "Gateway"
+            name        = local.grafana_gateway_name
+            sectionName = "http"
+          }]
+        }
+      }
+    }
+  }
 }

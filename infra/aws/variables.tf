@@ -46,7 +46,7 @@ variable "argocd_namespace" {
 
 variable "argocd_chart_version" {
   type    = string
-  default = "7.8.2"
+  default = "10.9.1"
 }
 
 variable "additional_cluster_admin_arns" {
@@ -455,4 +455,46 @@ variable "break_glass_max_session_duration" {
     condition     = var.break_glass_max_session_duration >= 3600 && var.break_glass_max_session_duration <= 43200
     error_message = "max_session_duration must be between 3600 and 43200 seconds (AWS limits)."
   }
+}
+
+variable "enable_monitoring" {
+  description = "Install VictoriaMetrics (victoria-metrics-k8s-stack) and Grafana through Argo CD."
+  type        = bool
+  default     = true
+}
+
+variable "monitoring_namespace" {
+  description = "Namespace for VictoriaMetrics, Grafana and their exporters."
+  type        = string
+  default     = "monitoring"
+}
+
+variable "victoria_metrics_k8s_stack_chart_version" {
+  description = "Version of the victoria-metrics-k8s-stack Helm chart."
+  type        = string
+  default     = "0.92.1"
+}
+
+variable "monitoring_retention" {
+  description = "How long VMSingle keeps samples. Units: h, d, w, y; a bare number means months."
+  type        = string
+  default     = "15d"
+}
+
+variable "monitoring_storage_size" {
+  description = "Size of the gp3 volume VMSingle stores its data on."
+  type        = string
+  default     = "20Gi"
+}
+
+variable "enable_grafana_route" {
+  description = "Publish Grafana through a dedicated kgateway Gateway (its own internet-facing NLB, plain HTTP). When false, reach it with kubectl port-forward."
+  type        = bool
+  default     = true
+}
+
+variable "grafana_hostname" {
+  description = "Hostname the Grafana HTTPRoute matches. Point a DNS record at the Grafana Gateway's NLB. Empty matches any Host header."
+  type        = string
+  default     = "grafana.alvarolinarescabre.com"
 }

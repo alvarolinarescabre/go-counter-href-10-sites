@@ -11,5 +11,12 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    {{- if .Values.metrics.enabled }}
+    # Only reachable inside the cluster: the HTTPRoute targets port 80 alone.
+    - port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
   selector:
     {{- include "counter-api.selectorLabels" . | nindent 4 }}

@@ -71,6 +71,14 @@ module "eks" {
       before_compute = true
     }
     coredns = {}
+    # Provisions the EBS volumes behind PersistentVolumeClaims (VMSingle,
+    # Grafana). Its IAM role lives in 11-monitoring.tf.
+    aws-ebs-csi-driver = {
+      pod_identity_association = [{
+        role_arn        = aws_iam_role.ebs_csi_driver.arn
+        service_account = "ebs-csi-controller-sa"
+      }]
+    }
   }
 
   # Karpenter cannot create the node its own controller runs on, so a managed

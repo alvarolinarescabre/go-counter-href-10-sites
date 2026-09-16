@@ -57,6 +57,16 @@ gatewayParameters:
     # Frontend ports that terminate TLS. Everything else stays plain HTTP.
     ports: "443"
     negotiationPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+metrics:
+  # Serve Prometheus metrics on their own port (never routed by the Gateway).
+  enabled: true
+  port: 9090
+  # VMServiceScrape so the VictoriaMetrics vmagent scrapes this app. Only
+  # rendered once the operator's CRD exists in the cluster, so the chart still
+  # syncs on a cluster without the monitoring stack.
+  serviceScrape:
+    enabled: true
+    interval: 30s
 resources:
   requests:
     cpu: 100m

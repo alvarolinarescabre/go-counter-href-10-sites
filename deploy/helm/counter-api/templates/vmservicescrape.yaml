@@ -1,0 +1,16 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceScrape.enabled (.Capabilities.APIVersions.Has "operator.victoriametrics.com/v1beta1/VMServiceScrape") }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: {{ include "counter-api.fullname" . }}
+  labels:
+    {{- include "counter-api.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "counter-api.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceScrape.interval }}
+{{- end }}

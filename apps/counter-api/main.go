@@ -202,13 +202,16 @@ func newServer(analyzer *Analyzer) *Server {
 // so callers keep serving the previous snapshot instead of piling up.
 func (s *Server) refresh(ctx context.Context) bool {
 	if !s.refreshMu.TryLock() {
+		refreshesTotal.WithLabelValues("skipped").Inc()
 		return false
 	}
 	defer s.refreshMu.Unlock()
 
 	started := time.Now()
 	results := s.analyzer.analyzeAll(ctx)
-	total := roundDuration(time.Since(started))
+	took := time.Since(started)
+	total := roundDuration(took)
+	recordRefresh(results, took)
 
 	tagJSON := make([][]byte, len(results))
 	for i := range results {
@@ -321,7 +324,7 @@ func roundDuration(duration time.Duration) float64 {
 func buildRouter(server *Server) *gin.Engine {
 	router := gin.New()
 	// No per-request logger: at high RPS its stdout write dominates the hot path.
-	router.Use(gin.Recovery())
+	router.Use(gin.Recovery(), metricsMiddleware)
 	router.GET("/", indexHandler)
 	router.GET("/healthcheck", healthHandler)
 	router.GET("/v1/tags", server.getTagsHandler)
@@ -342,6 +345,12 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9090"
+	}
+	go serveMetrics(":" + metricsPort)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

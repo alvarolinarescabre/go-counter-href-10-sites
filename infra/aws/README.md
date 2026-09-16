@@ -259,6 +259,20 @@ reviews cannot see.
   (`deploy/helm/counter-api`, branch `main`), deployed into the `counter-api` namespace
   with automated sync (`prune`, `selfHeal`, `CreateNamespace=true`).
 
+### Monitoring (`11-monitoring.tf`)
+- **EBS CSI driver** addon (Pod Identity role `<name>-ebs-csi-driver`) and a default
+  encrypted **`gp3` StorageClass** -- without Auto Mode nothing else can provision volumes.
+- **Application** `victoria-metrics-k8s-stack` (Argo CD, namespace `monitoring`):
+  VictoriaMetrics operator, VMSingle (`monitoring_retention`, `monitoring_storage_size`
+  on gp3), vmagent, node-exporter, kube-state-metrics and Grafana (5Gi gp3) with the
+  default Kubernetes dashboards. Alertmanager and vmalert are off (no receivers yet);
+  controller-manager/scheduler/etcd scrapes are off because EKS hides the control plane.
+- **Grafana ingress**: a dedicated kgateway `Gateway` + NLB (plain HTTP), with the
+  HTTPRoute rendered by the Grafana chart for `grafana_hostname`.
+- **counter-api metrics**: the app serves Prometheus metrics on `:9090/metrics` (never
+  routed by the Gateway); its chart adds a `VMServiceScrape` once the operator CRDs
+  exist, and the `counter-api` dashboard ships from `deploy/monitoring/dashboards/`.
+
 ### Argo CD ingress (`06-argocd-ingress.tf`, optional)
 
 Off by default — Argo CD ships no Ingress/Gateway of its own, so out of the box the UI is
@@ -529,7 +543,7 @@ already exists.
 | `private_subnets`       | Private subnet CIDR blocks            | `10.0.1.0/24`, `10.0.2.0/24`, `10.0.3.0/24` |
 | `public_subnets`        | Public subnet CIDR blocks             | `10.0.101.0/24`, `10.0.102.0/24`, `10.0.103.0/24` |
 | `argocd_namespace`      | Namespace for Argo CD                 | `argocd`            |
-| `argocd_chart_version`  | Argo CD Helm chart version            | `7.8.2`             |
+| `argocd_chart_version`  | Argo CD Helm chart version            | `10.9.1`            |
 | `enable_argocd_route`   | Expose the Argo CD UI through kgateway | `false`            |
 | `argocd_hostname`       | Hostname matched by the Argo CD HTTPRoute | `argocd.chamo.local` |
 | `argocd_gateway_create` | Create a dedicated Gateway (+ its own NLB) for Argo CD instead of reusing an existing one | `false` |
@@ -567,6 +581,13 @@ already exists.
 | `load_balancer_controller_chart_version` | aws-load-balancer-controller chart version | `3.5.0` |
 | `load_balancer_controller_namespace` | Namespace it runs in       | `kube-system`       |
 | `load_balancer_controller_service_account` | Its service account (bound to the Pod Identity association) | `aws-load-balancer-controller` |
+| `enable_monitoring` | Install VictoriaMetrics + Grafana via Argo CD | `true` |
+| `monitoring_namespace` | Namespace for the monitoring stack | `monitoring` |
+| `victoria_metrics_k8s_stack_chart_version` | victoria-metrics-k8s-stack chart version | `0.92.1` |
+| `monitoring_retention` | VMSingle retention | `15d` |
+| `monitoring_storage_size` | VMSingle gp3 volume size | `20Gi` |
+| `enable_grafana_route` | Publish Grafana through its own Gateway/NLB | `true` |
+| `grafana_hostname` | Hostname the Grafana HTTPRoute matches | `grafana.alvarolinarescabre.com` |
 
 Naming is derived in [locals.tf](locals.tf) as `<project_name>-<environment>`, e.g.
 `chamo-dev-vpc`, `chamo-dev-cluster`.
