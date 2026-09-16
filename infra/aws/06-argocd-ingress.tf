@@ -33,6 +33,9 @@ resource "kubectl_manifest" "argocd_gateway_parameters" {
   depends_on = [helm_release.argocd, kubectl_manifest.kgateway_helm]
 }
 
+# The Gateway makes kgateway create a Service of type LoadBalancer carrying
+# aws-load-balancer-* annotations; only the AWS Load Balancer Controller acts on
+# those, so without it the Gateway would come up with no address at all.
 resource "kubectl_manifest" "argocd_gateway" {
   count = var.enable_argocd_route && var.argocd_gateway_create ? 1 : 0
 
@@ -76,7 +79,10 @@ resource "kubectl_manifest" "argocd_gateway" {
     }
   })
 
-  depends_on = [kubectl_manifest.argocd_gateway_parameters]
+  depends_on = [
+    kubectl_manifest.argocd_gateway_parameters,
+    helm_release.aws_load_balancer_controller,
+  ]
 }
 
 resource "kubectl_manifest" "argocd_httproute" {

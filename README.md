@@ -1,22 +1,75 @@
-# Counter API
+# go-counter-href-10-sites
 
-A Go service that counts words inside HTML links with absolute HTTP(S) hrefs.
-It uses Gin for HTTP routing and Swaggo for an interactive OpenAPI UI.
+A Go service that downloads multiple HTML pages and counts the words contained in
+links whose `href` is an absolute `http://` or `https://` URL. The application
+exposes an HTTP API with Gin and a Swagger interface.
 
-## Monorepo Layout
+The repository also contains the entire AWS execution platform:
 
-- `apps/counter-api/` - Go/Gin application, tests, generated Swagger docs, and Dockerfile
-- `deploy/helm/counter-api/` - Helm chart for Kubernetes
-- `deploy/argocd/` - ArgoCD AppProject/Application for `counter-api`, plus the kgateway
-  bootstrap manifests (Gateway API CRDs, kgateway CRDs/controller, `GatewayParameters`)
-- `infra/aws/` - Terraform that provisions the EKS cluster and bootstraps Argo CD; see
-  [infra/aws/README.md](infra/aws/README.md)
-- `.github/workflows/deploy.yml` - tests, image build and publish to GHCR, GitOps
-  promotion (commits the new tag into the chart), and the Argo CD sync
+- Amazon EKS for Kubernetes.
+- Terraform for VPC, cluster, nodes, IAM, ECR, Karpenter, and controllers.
+- Argo CD to synchronize Kubernetes from Git.
+- Gateway API + kgateway to publish the application via an NLB.
+- Helm to package the `counter-api` deployment.
+- GitHub Actions to build the image, publish it to ECR, and update the tag
+  that Argo CD synchronizes.
 
-## Local Development
+## Architecture and deployment flow
 
-Requires Go 1.24 or newer.
+```text
+GitHub push to main
+        |
+        v
+GitHub Actions -- build Docker -- push ECR -- update values.yaml
+                                                   |
+                                                   v
+Git Repository <- Argo CD <- Application <- Helm chart
+                                      |
+                                      v
+                         Deployment + Service + Gateway + HTTPRoute
+                                      |
+                                      v
+                              AWS NLB -> counter-api
+```
+
+Terraform is used to create the platform and hand control to Argo CD.
+After `terraform apply`, Terraform does not directly manage application objects:
+Argo CD's `Application` observes `deploy/helm/counter-api` on the `main` branch
+and applies its changes automatically.
+
+## Repository structure
+
+```text
+apps/counter-api/              Go code, tests, Swagger, and Dockerfile
+deploy/helm/counter-api/       Helm chart for the application
+deploy/argocd/                 Application, AppProject, and kgateway
+infra/aws/                     Terraform for AWS/EKS
+infra/aws/bootstrap/           Initial IAM for GitHub Actions
+.github/workflows/deploy.yml   Build, push to ECR, and GitOps promotion
+```
+
+## Requirements
+
+To run the application locally:
+
+- Go 1.24 or newer.
+- Docker, if you want to build the image locally.
+
+To deploy on AWS:
+
+- AWS account with permissions to create VPC, EKS, IAM, ECR, NLB, KMS, SQS,
+  EventBridge, and CloudWatch Logs.
+- Terraform 1.10 or newer. The backend uses native S3 locking via `use_lockfile`.
+- AWS CLI v2.
+- `kubectl`.
+- Git and write access to the repository.
+- Outbound internet access from the machine running Terraform. Terraform queries
+  `https://checkip.amazonaws.com` to restrict the public EKS endpoint to the
+  current IP.
+- An AWS Identity Center identity assigned to the account, if you will use human
+  access configured by `infra/aws/10-cluster-access.tf`.
+
+## Local development
 
 ```bash
 cd apps/counter-api
@@ -24,102 +77,320 @@ go mod download
 go run .
 ```
 
-The server listens on `http://localhost:8080` by default. Configure it with:
+The server listens on `http://localhost:8080`. Available variables:
 
-- `PORT`: HTTP port, default `8080`
-- `TARGET_URLS`: comma-separated URLs, default is the ten configured sites
-- `HTTP_TIMEOUT_SECONDS`: per outbound fetch timeout, default `10`
-- `REFRESH_INTERVAL_SECONDS`: how often the background refresher re-fetches every
-  target, default `60`
+| Variable | Default | Description |
+|---|---:|---|
+| `PORT` | `8080` | Server HTTP port |
+| `TARGET_URLS` | 10 predefined sites | Comma-separated URLs |
+| `HTTP_TIMEOUT_SECONDS` | `10` | Timeout for each fetch |
+| `REFRESH_INTERVAL_SECONDS` | `60` | Cache refresh interval |
 
-### Request path is cache-only
+The request does not fetch pages. A background refresher fetches the configured
+URLs and publishes an atomic snapshot in memory. That is why query routes read
+the cache and respond without making outbound HTTP calls during the request.
 
-The target URLs are fixed, so counter-api does **not** fetch them on the request
-path. A background refresher fetches all targets every `REFRESH_INTERVAL_SECONDS`
-(the fan-out is concurrent), serializes the result once, and atomically swaps it
-into an in-memory snapshot. `GET /v1/tags` and `GET /v1/tags/{id}` are then a
-lock-free read of pre-serialized JSON — no goroutines, no HTTP calls, no
-marshaling per request — which is what lets a single instance sustain thousands
-of requests per second. `GET /v1/cache/clear` forces one out-of-band refresh.
-The cache is warmed synchronously before the server accepts traffic; a request
-that arrives before the first refresh finishes gets `503`.
-
-See [apps/counter-api/loadtest/](apps/counter-api/loadtest/) for a 5000 req/s
-load test (k6 / vegeta), a deterministic stub origin, and hot-path benchmarks.
-
-Run tests with:
+Run tests:
 
 ```bash
 cd apps/counter-api
 go test ./...
 ```
 
-## API
-
-- `GET /` - API navigation
-- `GET /healthcheck` - health check
-- `GET /v1/tags` - count links for all configured URLs
-- `GET /v1/tags/{url_id}` - count links for one configured URL
-- `GET /v1/cache/clear` - force an out-of-band refresh of the cached snapshot
-- `GET /docs` - redirects directly to the interactive Swagger UI
-- `GET /swagger/index.html` - interactive Swagger UI
-
-## kgateway Gateway and HTTPRoute
-
-The Helm chart deploys a `Gateway` and an `HTTPRoute` by default. The Gateway
-uses the `kgateway` GatewayClass and listens on HTTP port 80. The HTTPRoute
-routes `counter-api.chamo.local/*` to the application Service. Configure the
-hostname and Gateway reference in `deploy/helm/counter-api/values.yaml` before
-deploying:
-
-```yaml
-httpRoute:
-  enabled: true
-  gateway:
-    name: kgateway
-    sectionName: http
-  hostnames:
-    - api.example.com
-```
-
-To serve it over HTTPS, put an ACM certificate on the NLB — it terminates TLS
-and forwards plain HTTP to a second Gateway listener, so the listener protocol
-stays `HTTP` and nothing inside the cluster handles a certificate:
-
-```yaml
-gateway:
-  https:
-    enabled: true   # adds the :443 listener
-gatewayParameters:
-  tls:
-    certificateArn: arn:aws:acm:eu-west-1:<account>:certificate/<id>
-httpRoute:
-  gateway:
-    sectionNames: [http, https]
-```
-
-The certificate must be in the cluster's region and cover the route hostnames.
-
-The same mechanism can expose the Argo CD UI itself: `infra/aws/` has an
-`enable_argocd_route` variable that creates an `HTTPRoute` for `argocd-server`,
-either on the Gateway above or on a dedicated one with its own NLB
-(`argocd_gateway_create`). It is off by default — without it Argo CD is reachable
-only through `kubectl port-forward`. See
-[infra/aws/README.md](infra/aws/README.md#argo-cd-ingress-06-argocd-ingresstf-optional).
-
-The Gateway API CRDs and the `kgateway` GatewayClass must already exist in the
-cluster. kgateway provisions an external address for the Gateway; create a DNS
-`A` or `CNAME` record for the configured hostname pointing to that address.
-ArgoCD applies the Gateway and HTTPRoute together with the Helm release.
-
-Swagger is generated from annotations in `apps/counter-api/main.go`:
+Regenerate Swagger after modifying annotations:
 
 ```bash
 cd apps/counter-api
 go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g main.go -o docs
 ```
 
-## Docker
+## API
+
+| Method and route | Purpose |
+|---|---|
+| `GET /` | API navigation |
+| `GET /healthcheck` | Health check |
+| `GET /v1/tags` | Count for all configured URLs |
+| `GET /v1/tags/{url_id}` | Count for a single URL |
+| `GET /v1/cache/clear` | Force an out-of-band refresh |
+| `GET /docs` | Redirect to Swagger UI |
+| `GET /swagger/index.html` | Swagger UI |
+
+## AWS deployment, step by step
+
+The following steps must be executed from the repository root, unless otherwise
+stated. Default values create resources in `eu-west-1`, with project `chamo` and
+environment `dev`.
+
+### 1. Configure and verify AWS credentials
+
+Use an AWS profile or environment variables. For Identity Center:
+
+```bash
+aws configure sso --profile chamo-dev-eks
+aws sso login --profile chamo-dev-eks
+export AWS_PROFILE=chamo-dev-eks
+aws sts get-caller-identity
+```
+
+The identity that runs the first `terraform apply` receives cluster admin
+permissions via `enable_cluster_creator_admin_permissions`. For regular access,
+the Identity Center permission set must be assigned to the AWS account
+beforehand; Terraform looks for the `AWSReservedSSO_*` role that Identity
+Center creates.
+
+### 2. Create the remote Terraform bucket
+
+The backend is defined literally in
+[`infra/aws/providers.tf`](infra/aws/providers.tf): bucket
+`chamo-terraform-state-2027`, region `eu-west-1`, key `terraform.tfstate`, and
+locking via `terraform.tfstate.tflock`.
+
+The bucket must exist before `terraform init`:
+
+```bash
+aws s3api create-bucket \
+  --bucket chamo-terraform-state-2027 \
+  --region eu-west-1 \
+  --create-bucket-configuration LocationConstraint=eu-west-1
+
+aws s3api put-bucket-versioning \
+  --bucket chamo-terraform-state-2027 \
+  --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+  --bucket chamo-terraform-state-2027 \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+
+If you change the bucket or region, first edit the `backend "s3"` block in
+`infra/aws/providers.tf`. Do not rely on CI variables for this backend: a
+`terraform init` without the expected variable could create local state and
+produce duplicate resources.
+
+### 3. Prepare GitHub Actions IAM users (optional but necessary for CI)
+
+This step runs once with admin credentials. The separate root creates two users:
+
+- `gha-counter-api-terraform-plan`: read-only for automatic plans.
+- `gha-counter-api-terraform-apply`: write for manual apply/destroy.
+
+```bash
+cd infra/aws/bootstrap
+terraform init
+terraform plan
+terraform apply
+```
+
+By default, it does not create access keys to avoid storing secrets in local
+state. Create keys outside Terraform:
+
+```bash
+aws iam create-access-key --user-name gha-counter-api-terraform-plan
+aws iam create-access-key --user-name gha-counter-api-terraform-apply
+```
+
+Save the values once in GitHub and do not include them in the repository. If the
+users already exist, import them before `apply`:
+
+```bash
+terraform import 'aws_iam_user.ci["plan"]' gha-counter-api-terraform-plan
+terraform import 'aws_iam_user.ci["apply"]' gha-counter-api-terraform-apply
+terraform apply
+```
+
+Permission and adoption details are in
+[`infra/aws/bootstrap/README.md`](infra/aws/bootstrap/README.md).
+
+### 4. Configure Identity Center and Terraform variables
+
+Before the main apply:
+
+1. Assign to this account the permission set you want to use for EKS.
+2. Confirm that the `AWSReservedSSO_*` role exists in IAM.
+3. Review `infra/aws/variables.tf` and create a local `terraform.tfvars` if you
+   need different names, CIDRs, region, or certificates.
+
+Minimal example:
+
+```hcl
+region      = "eu-west-1"
+project_name = "chamo"
+environment  = "dev"
+argocd_hostname = "argocd.example.com"
+enable_argocd_route = true
+argocd_gateway_create = true
+argocd_gateway_tls_certificate_arn = "arn:aws:acm:eu-west-1:ACCOUNT:certificate/ID"
+```
+
+The ACM certificate must exist in the same region as EKS and cover the hostname.
+The application chart has its own hostname and certificate configuration in
+[`deploy/helm/counter-api/values.yaml`](deploy/helm/counter-api/values.yaml).
+
+### 5. Initialize Terraform and review the plan
+
+```bash
+cd infra/aws
+terraform init
+terraform fmt -check
+terraform validate
+terraform plan -out=tfplan
+```
+
+Especially review region, CIDRs, names, and certificate ARN. The plan includes
+VPC, subnets, NAT Gateway, EKS, node group, Karpenter, AWS Load Balancer
+Controller, Argo CD, Gateway API, kgateway, and ECR.
+
+### 6. Create the infrastructure
+
+```bash
+terraform apply tfplan
+```
+
+The operation may take several minutes. Terraform applies AWS resources and
+Kubernetes/Helm providers that depend on the newly created cluster in a single
+run.
+
+When done, save these outputs:
+
+```bash
+terraform output ecr_repository_url
+terraform output -raw instructions
+```
+
+The value of `ecr_repository_url` must match `image.repository` in
+`deploy/helm/counter-api/values.yaml`. ECR uses immutable tags: each deployment
+must have a unique tag, typically the commit SHA.
+
+### 7. Configure `kubectl`
+
+```bash
+aws eks update-kubeconfig \
+  --region eu-west-1 \
+  --name chamo-dev-cluster \
+  --profile chamo-dev-eks
+
+kubectl auth whoami
+kubectl auth can-i --list
+kubectl get nodes
+```
+
+If `kubectl` authenticates but returns `forbidden`, usually the permission set is
+not included in `sso_access_permission_sets` or was not assigned to the account.
+Fix it and re-run `terraform apply`.
+
+### 8. Publish the first image to ECR
+
+The infrastructure creates the repository, but not an image. Before expecting
+the Deployment to be healthy, you must publish an image.
+
+The recommended way is to run the `Deploy` workflow from GitHub. To do it
+manually:
+
+```bash
+export AWS_REGION=eu-west-1
+export ECR_REPOSITORY=go-counter-href-10-sites
+export IMAGE_TAG=$(git rev-parse HEAD)
+export ECR_URL=$(terraform -chdir=infra/aws output -raw ecr_repository_url)
+export ECR_REGISTRY=${ECR_URL%%/*}
+
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+docker build -t "$ECR_REPOSITORY:$IMAGE_TAG" \
+  -f apps/counter-api/Dockerfile apps/counter-api
+docker tag "$ECR_REPOSITORY:$IMAGE_TAG" "$ECR_URL:$IMAGE_TAG"
+docker push "$ECR_URL:$IMAGE_TAG"
+```
+
+Then, update `image.tag` in `deploy/helm/counter-api/values.yaml` with the same
+SHA and push to `main`. Argo CD will detect the commit and synchronize the
+chart.
+
+### 9. Verify Argo CD, kgateway, and the application
+
+```bash
+kubectl get applications -n argocd
+kubectl get pods -n argocd
+kubectl get pods -n counter-api
+kubectl get gateway -A
+kubectl get httproute -A
+kubectl get svc -A
+```
+
+The `Application` has automatic synchronization with `prune`, `selfHeal`, and
+`CreateNamespace=true`. If `ImagePullBackOff` appears, check that the tag exists
+in ECR and that `image.repository` points to the correct account and region.
+
+### 10. Get the public URL
+
+```bash
+kubectl get gateway public-nlb-gateway -n counter-api \
+  -o jsonpath='{.status.addresses[0].value}{"\n"}'
+```
+
+Create a DNS `CNAME` record pointing to the NLB hostname and matching
+`httpRoute.hostnames`. For local testing, you can use a temporary hostname in
+`/etc/hosts`, though a CNAME is preferable because an NLB can change IPs.
+
+Test the application:
+
+```bash
+curl -i https://counter-api.example.com/healthcheck
+curl -i https://counter-api.example.com/v1/tags
+```
+
+HTTPS terminates TLS at the NLB using ACM; inside the cluster, the Gateway
+listener receives plain HTTP. The ACM ARN must be in the same region.
+
+### 11. Access Argo CD
+
+By default, you can use port-forward:
+
+```bash
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl -n argocd port-forward svc/argocd-server 8080:80
+```
+
+Open `http://localhost:8080`, user `admin`. If `enable_argocd_route=true`, use
+`argocd_hostname` and check the Gateway/NLB:
+
+```bash
+kubectl get httproute -n argocd
+kubectl get gateway -n argocd
+```
+
+Argo CD is configured in `insecure` mode: TLS must terminate at the NLB, not at
+the pod.
+
+## Automatic deployment with GitHub Actions
+
+The workflow [`deploy.yml`](.github/workflows/deploy.yml) runs on push to `main`
+except for changes affecting only Markdown or `docs/`, and also supports
+`workflow_dispatch`.
+
+The workflow registers the deployment in Port, obtains AWS credentials, builds
+`apps/counter-api/Dockerfile`, publishes the image to ECR with tag `${GITHUB_SHA}`,
+updates `image.tag`, and pushes the change. Argo CD detects that commit and
+synchronizes the Deployment.
+
+Configure in GitHub:
+
+- Secrets `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` with permissions to
+  log in and push to ECR.
+- Secrets `PORT_CLIENT_ID` and `PORT_CLIENT_SECRET`, because the workflow
+  updates the deployment in Port.
+- Write permissions for `GITHUB_TOKEN`, needed for the commit that updates the
+  Helm values.
+- The GitHub repository name must match the ECR repository expected by
+  `ECR_REPOSITORY`, or that variable must be updated in the workflow.
+
+No `imagePullSecret` is used: the IAM roles of managed nodes and nodes created
+by Karpenter have read permissions in ECR.
+
+## Local Docker
 
 ```bash
 docker build -t counter-api -f apps/counter-api/Dockerfile apps/counter-api
@@ -127,101 +398,73 @@ docker run --rm -p 8080:80 counter-api
 curl http://localhost:8080/healthcheck
 ```
 
-## Kubernetes and ArgoCD
+## Load test
 
-Apply the ArgoCD AppProject and Application:
+The [`apps/counter-api/loadtest`](apps/counter-api/loadtest) folder includes k6
+scenarios, Vegeta, a deterministic origin, and hot-path benchmarks. Consult its
+README before running load against a public environment.
+
+## Change application configuration
+
+Edit [`deploy/helm/counter-api/values.yaml`](deploy/helm/counter-api/values.yaml)
+to change replicas, resources, hostname, listeners, or certificate. Validate the
+chart before pushing:
 
 ```bash
-kubectl apply -f deploy/argocd/app-project.yaml
-kubectl apply -f deploy/argocd/application.yaml
+helm lint deploy/helm/counter-api
+helm template counter-api deploy/helm/counter-api
 ```
 
-A push to `main` touching `apps/counter-api/**` runs
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml): `go test ./...`,
-then a build and push to the **Amazon ECR** repository provisioned by
-[infra/aws/07-ecr.tf](infra/aws/07-ecr.tf), tagged with the immutable
-`sha-<commit>`, then a commit of that tag into
-[deploy/helm/counter-api/values.yaml](deploy/helm/counter-api/values.yaml).
+Argo CD will apply the change once it reaches `main`. Code changes must generate
+a new image with a new tag, because ECR is configured with immutable tags.
 
-The registry lives in the cluster's own AWS account, which is what removes the
-pull credential problem: EKS Auto Mode's node IAM role carries
-`AmazonEC2ContainerRegistryPullOnly`, so kubelet authenticates with the node's
-own identity. There is no `imagePullSecret` anywhere, nothing to rotate, and
-the pull never leaves AWS.
+## Destroy the environment
 
-That commit is the deploy: Argo CD watches the chart path and syncs it. The
-workflow's last job only asks Argo CD to reconcile *now* rather than on its own
-polling interval, and it is skipped when the `ARGOCD_SERVER` /
-`ARGOCD_AUTH_TOKEN` secrets are absent — the Application's automated sync
-(`prune`, `selfHeal`) still picks the change up. Nothing in CI runs `kubectl`.
+Before destroying, confirm you want to remove the VPC, EKS, NLB, ECR, IAM, and
+other resources:
 
-The workflow filters out `deploy/**` so its own promotion commit does not
-retrigger it. Three things it needs from you:
+```bash
+cd infra/aws
+terraform plan -destroy
+terraform destroy
+```
 
-1. **`terraform apply` first.** The ECR repository has to exist before the first
-   push. Copy `terraform output ecr_repository_url` into `image.repository` in
-   the Helm values if your account or region differs from what is committed there.
-2. **AWS credentials as repo secrets** — `AWS_ACCESS_KEY_ID` /
-   `AWS_SECRET_ACCESS_KEY` for a user allowed to push to that repository
-   (`ecr:GetAuthorizationToken` plus the `ecr:*Layer*`/`ecr:PutImage` set), and
-   optionally the `AWS_REGION` / `ECR_REPOSITORY` repo variables. This is the
-   cost of ECR over GHCR: pushing needs real credentials rather than the
-   built-in `GITHUB_TOKEN`. Swapping the static key for OIDC
-   (`role-to-assume`) is a drop-in change to the one step that configures them.
-3. **Push access to `main`.** The promotion commits straight to the branch, so
-   branch protection requiring a pull request will block it.
+The remote Terraform bucket and its versions are not part of this stack and
+should be deleted separately only if you no longer need the state history.
 
-The repository is `IMMUTABLE`, so the pipeline pushes only `sha-<commit>` and
-never a floating `latest` — a second push of such a tag would be rejected. A
-lifecycle policy keeps the last 20 `sha-` images and expires untagged ones after
-a day.
+## Troubleshooting
 
-## Infrastructure (EKS + ArgoCD bootstrap)
+**The EKS endpoint is no longer accessible.** The public API is restricted to the
+IP detected during `terraform apply`. Changing networks requires re-running
+`terraform apply` to update the rule.
 
-`infra/aws/` contains the Terraform that provisions the AWS EKS cluster this app
-runs on and bootstraps it end to end: VPC, EKS, an Argo CD `helm_release`, the
-Gateway API CRDs, kgateway (as the Gateway API implementation, exposed via an AWS
-NLB), and the `AppProject`/`Application` from `deploy/argocd/` that point Argo CD
-back at `deploy/helm/counter-api` in this same repo. See
-[infra/aws/README.md](infra/aws/README.md) for architecture, prerequisites, and
-deployment steps.
+**Pods are in `ImagePullBackOff`.** Check `image.repository`, `image.tag`, that
+the image exists in ECR, and that the node has read permissions.
 
-`.github/workflows/terraform-aws.yml` validates that Terraform on every PR
-(`fmt`/`validate`, no AWS access needed), runs a read-only `plan` automatically
-on every push to `main`, and — on a manual `workflow_dispatch` gated by the
-`aws-eks` GitHub Environment — plans/applies/destroys it against the real AWS
-account using a static AWS access key stored as a GitHub secret. The S3 state
-backend (bucket/key/region, native locking) is pinned as literal values in
-[infra/aws/providers.tf](infra/aws/providers.tf), not driven by GitHub
-variables — see that file's comment for why. See
-[infra/aws/README.md#continuous-deployment](infra/aws/README.md#continuous-deployment)
-for the one-time setup (IAM user(s)/access key(s), state bucket, repo
-secrets/variables).
+**The Gateway has no external address.** Check the Gateway, pods, and events:
 
-### What you need to set up in AWS/GitHub before this runs
+```bash
+kubectl get gateway -A
+kubectl describe gateway public-nlb-gateway -n counter-api
+kubectl -n kube-system get pods
+kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller
+```
 
-Until these exist, `plan-on-main` skips itself with a job-summary notice instead
-of failing, and the manual `workflow_dispatch` will error on `configure-aws-credentials`.
-Full commands and rationale in
-[infra/aws/README.md#continuous-deployment](infra/aws/README.md#continuous-deployment).
+**The route returns 404 or does not route by hostname.** The `Host` header must
+match `httpRoute.hostnames`; check that `HTTPRoute` is `Accepted=True` and
+`ResolvedRefs=True`.
 
-1. **Remote state**: the S3 bucket named in
-   [infra/aws/providers.tf](infra/aws/providers.tf)'s backend block (versioned,
-   encrypted). No DynamoDB table — state locking is native to the S3 backend
-   (`use_lockfile`).
-2. **IAM user(s) + access key(s)**: one read-only user for the automatic
-   `plan-on-main` job, and one read/write user for the manual apply/destroy job
-   (or a single read/write user for both, if you'd rather skip the split).
-3. **GitHub Environment** `aws-eks` (Settings → Environments) with required
-   reviewers, so a human approves every `apply`/`destroy`.
-4. **GitHub secrets**:
-   - Repo-level `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — the read-only
-     user's key.
-   - `aws-eks` environment-level `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-     (same names) — the read/write user's key; overrides the repo-level ones
-     only for the manual job.
-5. **GitHub variable** (optional): `AWS_REGION` — defaults to `eu-west-1`.
+**Argo CD is not synchronizing.** Check the status and events:
+
+```bash
+kubectl get application -n argocd
+kubectl describe application go-counter-href-10-sites -n argocd
+```
+
+**Terraform cannot find the SSO role.** First assign the permission set to the
+AWS account and verify that the `AWSReservedSSO_*` role exists; then re-run
+`terraform plan`.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
+This project is licensed under MIT.

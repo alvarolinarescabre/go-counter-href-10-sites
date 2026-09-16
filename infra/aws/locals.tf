@@ -6,8 +6,73 @@ locals {
   # EKS Cluster Information
   name_cluster     = "${local.name}-cluster"
   cluster_version  = var.cluster_version
-  ami_type         = "AL2_x86_64"
+  ami_type         = "AL2023_x86_64_STANDARD"
   node_groups_name = "${local.name}-ng"
+
+  # Karpenter discovers the subnets and the security group it should attach
+  # provisioned nodes to by tag, not by ID -- these are the values its
+  # EC2NodeClass selectors match on (08-karpenter.tf). The same value tags the
+  # private subnets (01-vpc.tf) and the node security group (02-eks.tf).
+  karpenter_discovery_tag = local.name_cluster
+  karpenter_node_pool     = "default"
+  karpenter_node_class    = "default"
+
+  # Human cluster access (10-cluster-access.tf)
+  #
+  # Short keys map to the AWS-managed EKS access policies. These are AWS's own
+  # ARNs, not IAM policies -- they live in the `eks::aws:cluster-access-policy/`
+  # namespace and mean nothing except attached to an access entry.
+  eks_access_policy_arns = {
+    "cluster-admin" = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+    "admin"         = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
+    "admin-view"    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminViewPolicy"
+    "edit"          = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+    "view"          = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+  }
+
+  # Identity Center provisions its roles under a path
+  # (/aws-reserved/sso.amazonaws.com/<region>/), and an EKS access entry must
+  # name the role WITHOUT it -- a path-carrying ARN either fails to match the
+  # principal at authentication time or is silently normalised, depending on the
+  # API surface. Rebuilding the ARN from the bare role name avoids the question
+  # entirely.
+  sso_role_arns = {
+    for k, d in data.aws_iam_roles.sso_permission_sets :
+    k => "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${regex("[^/]+$", one(d.arns))}"
+  }
+
+  sso_access_entries = {
+    for k, v in var.sso_access_permission_sets : "sso-${k}" => {
+      principal_arn = local.sso_role_arns[k]
+
+      policy_associations = {
+        (v.access_policy) = {
+          policy_arn = local.eks_access_policy_arns[v.access_policy]
+          access_scope = v.namespaces == null ? { type = "cluster" } : {
+            type       = "namespace"
+            namespaces = v.namespaces
+          }
+        }
+      }
+    }
+  }
+
+  break_glass_trusted_principals = length(var.break_glass_trusted_principals) > 0 ? var.break_glass_trusted_principals : [
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+  ]
+
+  break_glass_access_entries = var.break_glass_role_enabled ? {
+    break-glass = {
+      principal_arn = aws_iam_role.break_glass[0].arn
+
+      policy_associations = {
+        cluster-admin = {
+          policy_arn   = local.eks_access_policy_arns["cluster-admin"]
+          access_scope = { type = "cluster" }
+        }
+      }
+    }
+  } : {}
 
   # VPC Information
   name_vpc        = "${local.name}-vpc"

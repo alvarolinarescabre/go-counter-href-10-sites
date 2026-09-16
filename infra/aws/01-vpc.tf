@@ -22,6 +22,11 @@ module "vpc" {
   private_subnet_tags = {
     "kubernetes.io/cluster/${local.name_cluster}" = "shared"
     "kubernetes.io/role/internal-elb"             = 1
+
+    # Karpenter picks the subnets for the nodes it provisions by this tag
+    # (subnetSelectorTerms in the EC2NodeClass, 08-karpenter.tf). Only the
+    # private subnets carry it, so provisioned nodes never get a public IP.
+    "karpenter.sh/discovery" = local.karpenter_discovery_tag
   }
 
   map_public_ip_on_launch = true

@@ -51,12 +51,16 @@ variable "argocd_chart_version" {
 
 variable "additional_cluster_admin_arns" {
   description = <<-EOT
-    IAM principal ARNs (users or roles) to grant EKS cluster admin access to,
-    in addition to the identity that runs `terraform apply`
+    IAM principal ARNs (users or roles) granted EKS cluster admin directly, in
+    addition to the identity that runs `terraform apply`
     (enable_cluster_creator_admin_permissions already covers that one — e.g.
-    the GitHub Actions IAM user). Add your own local IAM user/role ARN here
-    (`aws sts get-caller-identity --query Arn --output text`) to be able to
-    run kubectl against the cluster from your machine.
+    the GitHub Actions IAM user).
+
+    This is the escape hatch, not the front door. Humans belong in
+    var.sso_access_permission_sets: an ARN listed here is a standing grant tied
+    to a long-lived principal, invisible to Identity Center's own access
+    reviews, and removing it takes a `terraform apply`. Use it for a machine
+    principal that cannot go through Identity Center or the break-glass role.
   EOT
   type        = list(string)
   default     = []
@@ -215,4 +219,234 @@ variable "ecr_keep_last_images" {
   EOT
   type        = number
   default     = 20
+}
+
+################################################################################
+# Managed node group (Karpenter's own footprint)
+################################################################################
+
+variable "node_group_instance_types" {
+  description = <<-EOT
+    Instance types for the EKS managed node group that hosts the cluster's
+    "system" workloads -- CoreDNS, the Karpenter controller itself, Argo CD and
+    kgateway. Karpenter cannot provision the node it runs on, so this group has
+    to exist and stay up independently of it; everything else is expected to
+    land on Karpenter-provisioned nodes.
+  EOT
+  type        = list(string)
+  default     = ["t3.medium"]
+}
+
+variable "node_group_min_size" {
+  description = "Minimum size of the managed node group."
+  type        = number
+  default     = 2
+}
+
+variable "node_group_max_size" {
+  description = "Maximum size of the managed node group. Kept small on purpose -- growth beyond the system workloads is Karpenter's job, not this group's."
+  type        = number
+  default     = 3
+}
+
+variable "node_group_desired_size" {
+  description = "Desired size of the managed node group."
+  type        = number
+  default     = 2
+}
+
+variable "node_group_disk_size" {
+  description = "Root EBS volume size (GiB) for the managed node group's nodes."
+  type        = number
+  default     = 30
+}
+
+variable "node_group_capacity_type" {
+  description = "Billing model for the managed node group: ON_DEMAND or SPOT. Keep it ON_DEMAND -- these nodes carry the controllers that would have to reschedule everything else."
+  type        = string
+  default     = "ON_DEMAND"
+}
+
+################################################################################
+# Karpenter
+################################################################################
+
+variable "karpenter_chart_version" {
+  description = "Version of the Karpenter Helm chart (oci://public.ecr.aws/karpenter/karpenter)."
+  type        = string
+  default     = "1.14.0"
+}
+
+variable "karpenter_namespace" {
+  description = "Namespace the Karpenter controller runs in. kube-system is what the chart's IAM/pod-identity wiring in the terraform-aws-modules/eks karpenter submodule defaults to."
+  type        = string
+  default     = "kube-system"
+}
+
+variable "karpenter_node_instance_categories" {
+  description = "Instance categories Karpenter may pick from for the nodes it provisions."
+  type        = list(string)
+  default     = ["c", "m", "r", "t"]
+}
+
+variable "karpenter_node_instance_generations_min" {
+  description = "Minimum instance generation Karpenter may pick (excludes old, slow, comparatively expensive families)."
+  type        = number
+  default     = 3
+}
+
+variable "karpenter_node_capacity_types" {
+  description = "Capacity types Karpenter may provision. With both listed it prefers spot and falls back to on-demand when no spot capacity is available."
+  type        = list(string)
+  default     = ["spot", "on-demand"]
+}
+
+variable "karpenter_node_cpu_limit" {
+  description = <<-EOT
+    Ceiling on the total vCPU Karpenter may have running across all the nodes
+    of its NodePool. This is the cost guardrail: without it a runaway
+    ReplicaSet can scale the AWS bill, not just the cluster.
+  EOT
+  type        = number
+  default     = 32
+}
+
+variable "karpenter_node_expire_after" {
+  description = "How long a Karpenter-provisioned node lives before it is drained and replaced, which is how nodes pick up new AMIs. Set to \"Never\" to disable."
+  type        = string
+  default     = "720h"
+}
+
+variable "karpenter_node_consolidation_after" {
+  description = "How long a node must sit underutilised/empty before Karpenter consolidates it away."
+  type        = string
+  default     = "1m"
+}
+
+variable "karpenter_node_ami_alias" {
+  description = "AMI family/version alias Karpenter resolves nodes from. \"@latest\" tracks new AMI releases; pin a version (e.g. al2023@v20250101) for reproducible node images."
+  type        = string
+  default     = "al2023@latest"
+}
+
+################################################################################
+# AWS Load Balancer Controller
+################################################################################
+
+variable "load_balancer_controller_chart_version" {
+  description = "Version of the aws-load-balancer-controller Helm chart. Must be >= 3.0 for the EKS Pod Identity credential path used in 09-load-balancer-controller.tf; older charts need IRSA instead."
+  type        = string
+  default     = "3.5.0"
+}
+
+variable "load_balancer_controller_namespace" {
+  description = "Namespace the AWS Load Balancer Controller runs in."
+  type        = string
+  default     = "kube-system"
+}
+
+variable "load_balancer_controller_service_account" {
+  description = "Service account name for the AWS Load Balancer Controller. The Pod Identity association is bound to this exact name, so the chart must be told to use it too."
+  type        = string
+  default     = "aws-load-balancer-controller"
+}
+
+################################################################################
+# Human cluster access (10-cluster-access.tf)
+################################################################################
+
+variable "sso_access_permission_sets" {
+  description = <<-EOT
+    IAM Identity Center permission sets that get access to the cluster, keyed by
+    the permission set's exact name (case sensitive -- it is matched against the
+    `AWSReservedSSO_<name>_<hash>` role Identity Center provisions in this
+    account).
+
+    Terraform does not create these permission sets, and does not assign them:
+    do that where Identity Center is administered, assign them to THIS account,
+    and then apply. A permission set that has never been assigned here has no
+    role to point an access entry at, and the apply fails saying so.
+
+      access_policy  Which AWS-managed EKS access policy the permission set
+                     gets: "cluster-admin" (full admin, cluster scope only),
+                     "admin", "admin-view", "edit" or "view".
+      namespaces     Restrict the grant to these namespaces. null (the default)
+                     means cluster-wide. Not valid with "cluster-admin", which
+                     AWS only allows at cluster scope.
+
+    An empty map means nobody reaches the cluster through Identity Center.
+  EOT
+
+  type = map(object({
+    access_policy = optional(string, "view")
+    namespaces    = optional(list(string))
+  }))
+
+  default = {
+    EKSClusterAdmin = {
+      access_policy = "cluster-admin"
+    }
+    EKSViewer = {
+      access_policy = "view"
+    }
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.sso_access_permission_sets :
+      contains(["cluster-admin", "admin", "admin-view", "edit", "view"], v.access_policy)
+    ])
+    error_message = "access_policy must be one of: cluster-admin, admin, admin-view, edit, view."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.sso_access_permission_sets :
+      v.namespaces == null || v.access_policy != "cluster-admin"
+    ])
+    error_message = "access_policy \"cluster-admin\" cannot be namespace-scoped; use \"admin\" with namespaces instead."
+  }
+}
+
+variable "break_glass_role_enabled" {
+  description = <<-EOT
+    Create the emergency cluster-admin role. Its point is to be independent of
+    Identity Center, so that an outage of the identity store or the access
+    portal does not also lock everyone out of the cluster. Turn it off only if
+    you have another Identity-Center-independent way in -- with it off and
+    var.additional_cluster_admin_arns empty, the only remaining admin is
+    whichever principal ran `terraform apply`.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "break_glass_trusted_principals" {
+  description = <<-EOT
+    IAM ARNs allowed to assume the break-glass role. Empty (the default) means
+    the account root ARN, which delegates the decision to the account's own IAM:
+    a principal can assume it only if an identity policy also allows it, which
+    is what the `<project>-<env>-eks-break-glass-assume` managed policy grants
+    to whoever you attach it to. Narrow this to specific ARNs if you would
+    rather the trust policy itself be the allow-list.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "break_glass_require_mfa" {
+  description = "Require the caller's session to carry MFA before it may assume the break-glass role."
+  type        = bool
+  default     = true
+}
+
+variable "break_glass_max_session_duration" {
+  description = "Seconds before an assumed break-glass session expires. Kept at the one-hour minimum on purpose: an emergency session should not outlive the emergency."
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.break_glass_max_session_duration >= 3600 && var.break_glass_max_session_duration <= 43200
+    error_message = "max_session_duration must be between 3600 and 43200 seconds (AWS limits)."
+  }
 }

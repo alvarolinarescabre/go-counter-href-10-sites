@@ -5,25 +5,25 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'URL objetivo a testear'
+        description: 'Target URL to test'
         required: true
         type: string
       vus:
-        description: 'Usuarios virtuales (VUs)'
+        description: 'Virtual Users (VUs)'
         required: true
         default: '10'
         type: string
       duration:
-        description: 'Duración del test (ej: 30s, 1m, 5m)'
+        description: 'Test duration (e.g: 30s, 1m, 5m)'
         required: true
         default: '30s'
         type: string
       port_run_id:
-        description: 'Port Run ID para reportar estado'
+        description: 'Port Run ID to report status'
         required: false
         type: string
       port_entity_id:
-        description: 'Identificador de la entidad loadTestRun en Port'
+        description: 'Identifier of the loadTestRun entity in Port'
         required: false
         type: string
 
@@ -36,7 +36,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ─── Instalar k6 (sin dirmngr / GPG keyserver) ──────────────────────────
+      # ─── Install k6 (without dirmngr / GPG keyserver) ──────────────────────────
       - name: Install k6
         run: |
           K6_VERSION="v0.54.0"
@@ -46,7 +46,7 @@ jobs:
           sudo mv /tmp/k6-${K6_VERSION}-linux-amd64/k6 /usr/local/bin/k6
           k6 version
 
-      # ─── Script k6 inline ───────────────────────────────────────────────────
+      # ─── Inline k6 script ───────────────────────────────────────────────────
       - name: Create k6 test script
         run: |
           cat > /tmp/load-test.js << 'EOF'
@@ -71,7 +71,7 @@ jobs:
           }
           EOF
 
-      # ─── Ejecutar k6 ────────────────────────────────────────────────────────
+      # ─── Run k6 ────────────────────────────────────────────────────────
       - name: Run k6 load test
         id: k6_run
         continue-on-error: true
@@ -83,7 +83,7 @@ jobs:
             --summary-export=/tmp/k6-summary.json \
             /tmp/load-test.js
 
-      # ─── Parsear métricas ────────────────────────────────────────────────────
+      # ─── Parse metrics ────────────────────────────────────────────────────
       - name: Parse k6 results
         id: parse_results
         run: |
@@ -113,7 +113,7 @@ jobs:
           echo "total_requests=$TOTAL"   >> $GITHUB_OUTPUT
           echo "error_rate=$ERROR"       >> $GITHUB_OUTPUT
 
-      # ─── Determinar estado ───────────────────────────────────────────────────
+      # ─── Determine status ───────────────────────────────────────────────────
       - name: Determine test status
         id: test_status
         run: |
@@ -123,7 +123,7 @@ jobs:
             echo "status=failed" >> $GITHUB_OUTPUT
           fi
 
-      # ─── Token de Port ───────────────────────────────────────────────────────
+      # ─── Port token ───────────────────────────────────────────────────
       - name: Get Port access token
         id: port_token
         run: |
@@ -133,7 +133,7 @@ jobs:
             | jq -r '.accessToken')
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
-      # ─── Actualizar entidad en Port con métricas ─────────────────────────────
+      # ─── Update Port entity with metrics ─────────────────────────────
       - name: Update Port entity with results
         if: ${{ inputs.port_entity_id != '' && inputs.port_entity_id != 'null' }}
         run: |
@@ -153,7 +153,7 @@ jobs:
               }
             }'
 
-      # ─── Subir artefacto ─────────────────────────────────────────────────────
+      # ─── Upload artifact ─────────────────────────────────────────────────────
       - name: Upload k6 summary artifact
         if: always()
         uses: actions/upload-artifact@v4

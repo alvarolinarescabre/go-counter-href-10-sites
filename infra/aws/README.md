@@ -30,8 +30,8 @@ manifests and then hands off control to Argo CD's own sync loop.
                          │                     │                        │
                          │           ┌─────────▼───────────┐            │
                          │           │   EKS Cluster       │            │
-                         │           │  (EKS Auto Mode /   │            │
-                         │           │  compute_config)    │            │
+                         │           │  managed node group │            │
+                         │           │  + Karpenter        │            │
                          │           │                     │            │
                          │           │  ┌───────────────┐  │            │
                          │           │  │   Argo CD     │  │            │
@@ -56,12 +56,15 @@ manifests and then hands off control to Argo CD's own sync loop.
 **Bootstrap flow (Terraform):**
 
 1. VPC (public + private subnets, single NAT Gateway).
-2. EKS cluster in the private subnets, using EKS's managed `compute_config` (Auto Mode
-   style, `general-purpose` node pool).
-3. Argo CD installed via Helm into the cluster.
-4. Gateway API standard CRDs applied, then the kgateway CRDs and kgateway controller
+2. EKS cluster in the private subnets, with a small EKS managed node group for the
+   cluster's own controllers.
+3. Karpenter (`08-karpenter.tf`) and the AWS Load Balancer Controller
+   (`09-load-balancer-controller.tf`) installed on that node group; from here on,
+   application capacity is provisioned on demand by Karpenter.
+4. Argo CD installed via Helm into the cluster.
+5. Gateway API standard CRDs applied, then the kgateway CRDs and kgateway controller
    installed as Argo CD `Application` resources (`kubectl_manifest`).
-5. An Argo CD `AppProject` and `Application` are created pointing at the `counter-api`
+6. An Argo CD `AppProject` and `Application` are created pointing at the `counter-api`
    Helm chart in this same monorepo; from this point on, Argo CD syncs and reconciles the
    application itself (GitOps hand-off).
 
@@ -87,12 +90,17 @@ manifests and then hands off control to Argo CD's own sync loop.
     ├── data.tf                        # Data sources: caller identity, AZs, public IP, EKS auth, CRD docs
     ├── outputs.tf                     # Post-apply instructions (kubeconfig, ArgoCD login, app access, destroy)
     ├── 01-vpc.tf                      # VPC module (terraform-aws-modules/vpc)
-    ├── 02-eks.tf                      # EKS module (terraform-aws-modules/eks)
+    ├── 02-eks.tf                      # EKS module (terraform-aws-modules/eks) + managed node group + addons
     ├── 03-argocd.tf                   # Argo CD Helm release
     ├── 04-ingress-controller.tf       # Gateway API CRDs + kgateway (CRDs and controller) via ArgoCD manifests
     ├── 05-app-deployment.tf           # ArgoCD AppProject + Application for counter-api
     ├── 06-argocd-ingress.tf           # Optional kgateway Gateway/HTTPRoute exposing the Argo CD UI
-    └── 07-ecr.tf                      # ECR repository + lifecycle policy for the app image
+    ├── 07-ecr.tf                      # ECR repository + lifecycle policy for the app image
+    ├── 08-karpenter.tf                # Karpenter IAM/SQS, controller, EC2NodeClass + NodePool
+    ├── 09-load-balancer-controller.tf # AWS Load Balancer Controller (IAM via Pod Identity + Helm)
+    ├── 10-cluster-access.tf           # Human access: Identity Center permission sets + break-glass role
+    ├── policies/                      # Vendored upstream IAM policy documents
+    └── bootstrap/                     # Separate root: the two CI IAM users and their policies
 ```
 
 ## Resources deployed
@@ -110,10 +118,105 @@ manifests and then hands off control to Argo CD's own sync loop.
   private subnets.
 - Public API endpoint access restricted to the operator's current public IP
   (`data.http.my_ip`).
-- `compute_config` enabled with the `general-purpose` node pool (EKS-managed compute,
-  no self-managed node groups to maintain).
+- **EKS Auto Mode explicitly disabled** (`compute_config = { enabled = false }`).
+  Its bundled, AWS-managed Karpenter would compete with the one we run ourselves,
+  and the block is kept rather than deleted because that is what emits the API
+  fields that turn Auto Mode — plus its ELB and block-storage integrations — back
+  off on a cluster that already had them on.
+- **Managed node group** `system` (`var.node_group_*`, default 2 × `t3.medium`
+  on-demand, min 2 / max 3) running on AL2023. It exists because Karpenter cannot
+  provision the node its own controller runs on: this group carries CoreDNS,
+  Karpenter, the AWS Load Balancer Controller, Argo CD and kgateway, and nothing
+  else is expected to stay on it.
+- **Addons**, which Auto Mode used to supply implicitly: `vpc-cni`, `kube-proxy`
+  and `eks-pod-identity-agent` with `before_compute = true` (nodes come up
+  NotReady without CNI, and the Pod Identity agent is what backs the Karpenter
+  and load-balancer-controller IAM roles), then `coredns` once nodes exist.
+- **`karpenter.sh/discovery` tag** on the node security group, matching the one on
+  the private subnets in `01-vpc.tf` — that pair is how Karpenter's `EC2NodeClass`
+  finds where to put new nodes.
 - Cluster creator is automatically granted admin permissions
   (`enable_cluster_creator_admin_permissions`).
+
+### Compute autoscaling (`08-karpenter.tf`)
+- **`module.karpenter`** (the `terraform-aws-modules/eks/aws//modules/karpenter`
+  submodule) creates the AWS side: the controller IAM role wired through EKS Pod
+  Identity, the node IAM role and instance profile, a cluster access entry so
+  those nodes may join, and the SQS queue + EventBridge rules that let Karpenter
+  drain an instance ahead of a spot interruption or scheduled maintenance.
+- **Karpenter controller** installed from `oci://public.ecr.aws/karpenter/karpenter`
+  (`var.karpenter_chart_version`), 2 replicas. The chart's default node affinity
+  keeps it off Karpenter-provisioned nodes, so it always lands on the managed
+  node group.
+- **`EC2NodeClass`** — AL2023 (`var.karpenter_node_ami_alias`), private subnets and
+  node security group selected by the `karpenter.sh/discovery` tag rather than by
+  ID, 50 GiB encrypted gp3 root volume.
+- **`NodePool`** — instance categories `c/m/r/t`, generation ≥ 3, amd64, spot with
+  on-demand fallback, `WhenEmptyOrUnderutilized` consolidation, nodes replaced
+  after `var.karpenter_node_expire_after` (30 days) so they pick up new AMIs, and
+  a hard `limits.cpu` of `var.karpenter_node_cpu_limit` (32) vCPU — the cost
+  guardrail that makes a runaway ReplicaSet leave pods `Pending` instead of
+  growing the bill.
+
+### Human access (`10-cluster-access.tf`)
+
+Reaching the cluster is two separate grants, and both are needed: an IAM
+principal to authenticate as, and an **EKS access entry** mapping that principal
+to an AWS-managed access policy. A principal with only the first authenticates
+fine and is then denied by RBAC on every call.
+
+> This is deliberately **not** IRSA. IRSA binds an IAM role to a Kubernetes
+> *service account* through the cluster's OIDC provider — it is how in-cluster
+> workloads get AWS credentials (it is what `module.karpenter` and the load
+> balancer controller use, via Pod Identity). A person running `kubectl` has no
+> service account to bind, so the human path is an access entry instead.
+
+**IAM Identity Center — the normal way in.** People sign in to the access
+portal, pick a permission set, and the credentials they receive are already an
+IAM role: `AWSReservedSSO_<permission set>_<hash>`. Nothing to assume by hand,
+nothing long-lived, and granting or revoking a person is group membership in the
+identity store rather than a `terraform apply`.
+
+Terraform does **not** create or assign the permission sets — that happens
+wherever Identity Center is administered, which is usually not this account.
+What it does is look the provisioned roles up (`data.aws_iam_roles`, filtered by
+`AWSReservedSSO_<name>_*` under `/aws-reserved/sso.amazonaws.com/`) and attach
+an access entry to each, because the `_<hash>` suffix is assigned by Identity
+Center and cannot be predicted here. So the order is: **assign the permission
+set to this account first, then apply.** One that has never been assigned has no
+role to point at, and a precondition fails the apply saying exactly that.
+
+`var.sso_access_permission_sets` maps permission set name → access level:
+
+| Key | `access_policy` | Grants |
+|---|---|---|
+| `EKSClusterAdmin` | `cluster-admin` | Full admin, cluster scope only |
+| `EKSViewer` | `view` | Read-only |
+
+`admin`, `admin-view` and `edit` are also available, and any of them except
+`cluster-admin` can be narrowed to specific `namespaces`.
+
+**The break-glass role.** An ordinary assumable IAM role with cluster-admin,
+MFA-gated, deliberately independent of Identity Center — if the identity store
+or the access portal is the thing that is broken, every SSO route into the
+cluster is broken with it. It is not a second everyday door: its
+`-break-glass-assume` managed policy is attached to nobody by default, you
+attach it during an incident and detach it afterwards, and every `AssumeRole` on
+it lands in CloudTrail under the human's own identity.
+
+`var.additional_cluster_admin_arns` remains as a raw list of principals granted
+cluster-admin directly. Reserve it for machine principals that can go through
+neither path — for a human it is a standing grant that Identity Center's access
+reviews cannot see.
+
+### Load balancing (`09-load-balancer-controller.tf`)
+- **AWS Load Balancer Controller**, installed from the `eks-charts` repo with an
+  IAM role attached through EKS Pod Identity and the controller's own upstream
+  IAM policy (vendored in `policies/aws-load-balancer-controller.json`).
+- This is **not optional**: Auto Mode used to provide it, and without it every
+  `service.beta.kubernetes.io/aws-load-balancer-*` annotation in this repo is
+  inert — the kgateway Gateways would sit forever with no NLB and no external
+  address.
 
 ### GitOps controller (`03-argocd.tf`)
 - **Argo CD** installed via the official Helm chart (`argo-cd`, `argoproj.github.io/argo-helm`)
@@ -144,8 +247,9 @@ manifests and then hands off control to Argo CD's own sync loop.
   pushes `sha-<commit>`, so an overwrite is always a mistake and the registry rejects it.
 - **Lifecycle policy**: expires untagged images after `var.ecr_untagged_expiry_days` and
   keeps the newest `var.ecr_keep_last_images` `sha-` builds.
-- No pull credential is needed in the cluster: EKS Auto Mode's node IAM role carries
-  `AmazonEC2ContainerRegistryPullOnly`, so kubelet pulls with the node's own identity.
+- No pull credential is needed in the cluster: both node IAM roles — the managed node
+  group's and the one Karpenter hands its nodes — carry an ECR read policy, so kubelet
+  pulls with the node's own identity.
 - `force_delete = true` so `terraform destroy` does not stall on a repository that still
   holds images.
 
@@ -258,10 +362,19 @@ terraform apply
 
 On success, the `instructions` output prints the exact commands to run. Summarized:
 
-**1. Configure kubectl:**
+**1. Configure kubectl** — through Identity Center, not with your own IAM keys:
 ```bash
-aws eks update-kubeconfig --region <region> --name <cluster_name>
+aws configure sso --profile <project>-<env>-eks     # one-time
+aws sso login --profile <project>-<env>-eks
+aws eks update-kubeconfig --region <region> --name <cluster_name> \
+  --profile <project>-<env>-eks
+
+kubectl auth whoami        # what the cluster thinks you are
+kubectl auth can-i --list  # what that gets you
 ```
+
+If `kubectl` authenticates but is denied everything, the permission set has no
+access entry: add its name to `var.sso_access_permission_sets` and re-apply.
 
 **2. Log in to Argo CD:**
 ```bash
@@ -331,34 +444,65 @@ to delete: `aws dynamodb delete-table --table-name <your-old-tf-lock-table>`.)
 
 ### 2. IAM user(s) and access key(s)
 
+Automated in [`bootstrap/`](bootstrap/) — a separate Terraform root that creates
+both users and their policies:
+
+```bash
+cd infra/aws/bootstrap
+terraform init && terraform apply
+```
+
+It is separate from this stack on purpose: these users *are* the credentials
+this stack runs with, so managing them from inside it would let an apply revoke
+the permissions of the run performing it — and the first apply could never
+happen at all, since the users must exist before anything can authenticate. It
+runs once, by a human with administrator credentials, and keeps local state.
+If the users already exist from the old manual setup, import them first; see
+[bootstrap/README.md](bootstrap/README.md).
+
 The workflow reads `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from GitHub secrets. GitHub
 resolves **environment** secrets before repo-level ones for any job bound to that
 environment, so defining the same secret names at both levels gives the two jobs
 different privilege without any extra workflow logic:
 
-| Secret scope | Used by | IAM user permissions |
-|---|---|---|
-| Repo-level (Settings → Secrets and variables → Actions) | `plan-on-main` (automatic, every push) | **Read-only**: `Describe*`/`List*`/`Get*` on VPC, EKS, IAM, ELB, plus read on the state bucket |
-| Environment-level, on `aws-eks` (Settings → Environments → aws-eks → secrets) | `terraform` (manual, reviewer-gated) | **Read/write**: everything the read-only user has, plus create/update/delete on VPC, EKS, IAM (for the EKS/IRSA roles the modules create), ELB/NLB, and read/write on the state bucket |
+| Secret scope | Used by | IAM user | Policies |
+|---|---|---|---|
+| Repo-level (Settings → Secrets and variables → Actions) | `plan-on-main` (automatic, every push) | `gha-counter-api-terraform-plan` | `ReadOnlyAccess` + `<project>-<env>-terraform-shared` |
+| Environment-level, on `aws-eks` (Settings → Environments → aws-eks → secrets) | `terraform` (manual, reviewer-gated) | `gha-counter-api-terraform-apply` | the above + `<project>-<env>-terraform-apply` |
 
-If you'd rather not maintain two IAM users, define `AWS_ACCESS_KEY_ID`/
-`AWS_SECRET_ACCESS_KEY` only at the repo level with the read/write policy — simpler, at
-the cost of the automatic `plan-on-main` job also holding write-capable credentials on
-every push to `main`.
+Two details in there are easy to get wrong, and both are handled in the shared
+policy rather than left to whoever sets this up:
 
-Create the user(s) and key(s):
+- **The state grant is not read-only, even for the plan user.**
+  `use_lockfile = true` in [`providers.tf`](providers.tf) means a plan writes and
+  deletes `terraform.tfstate.tflock`; without `s3:PutObject`/`s3:DeleteObject`
+  every plan fails to acquire its lock.
+- **`iam:ListRoles` is needed by both users.**
+  [`10-cluster-access.tf`](10-cluster-access.tf) resolves the `AWSReservedSSO_*`
+  roles Identity Center has provisioned in the account, and that lookup runs at
+  *plan* time — so the read-only job fails just as hard without it as the apply
+  job does.
+
+Access keys are opt-in (`var.create_access_keys`, default `false`) because
+Terraform stores the secret in state and this root's state is local. Left off,
+create them out of band:
 
 ```bash
-aws iam create-user --user-name gha-counter-api-terraform-plan   # read-only
-aws iam create-user --user-name gha-counter-api-terraform-apply  # read/write
-aws iam attach-user-policy --user-name gha-counter-api-terraform-plan  --policy-arn <read-only-policy-arn>
-aws iam attach-user-policy --user-name gha-counter-api-terraform-apply --policy-arn <read-write-policy-arn>
 aws iam create-access-key --user-name gha-counter-api-terraform-plan
 aws iam create-access-key --user-name gha-counter-api-terraform-apply
 ```
 
-Scope the attached policies down from `AdministratorAccess` once the exact resource ARNs
-are known; avoid AWS managed `PowerUserAccess`/`AdministratorAccess` for the long term.
+If you'd rather not maintain two IAM users, define `AWS_ACCESS_KEY_ID`/
+`AWS_SECRET_ACCESS_KEY` only at the repo level with the apply user's key — simpler, at
+the cost of the automatic `plan-on-main` job also holding write-capable credentials on
+every push to `main`.
+
+The apply policy is scoped by name for IAM (`<project>-<env>-*`, plus a
+conditioned `CreateServiceLinkedRole` and the cluster's OIDC provider) and
+guarded by explicit `Deny` statements so it cannot widen its own permissions,
+but its non-IAM half is still service-level `ec2:*`/`eks:*`/… on `*`. Tightening
+that to resource ARNs is the next step and needs the ARNs of a cluster that
+already exists.
 
 ### 3. GitHub repo configuration
 
@@ -401,6 +545,27 @@ are known; avoid AWS managed `PowerUserAccess`/`AdministratorAccess` for the lon
 | `ecr_repository_name`   | ECR repository holding the app image  | `counter-api`       |
 | `ecr_untagged_expiry_days` | Days before untagged images expire | `1`                |
 | `ecr_keep_last_images`  | How many `sha-` images to keep        | `20`                |
+| `sso_access_permission_sets` | Identity Center permission sets → EKS access level | `EKSClusterAdmin` = `cluster-admin`, `EKSViewer` = `view` |
+| `break_glass_role_enabled` | Create the emergency cluster-admin role | `true`           |
+| `break_glass_trusted_principals` | Who may assume it; empty = account root (delegates to IAM) | `[]` |
+| `break_glass_require_mfa` | Require MFA to assume it             | `true`              |
+| `break_glass_max_session_duration` | Seconds before the session expires | `3600`      |
+| `node_group_instance_types` | Instance types for the system managed node group | `["t3.medium"]` |
+| `node_group_min_size` / `_desired_size` / `_max_size` | Size of that node group | `2` / `2` / `3` |
+| `node_group_capacity_type` | Billing model for that node group  | `ON_DEMAND`         |
+| `node_group_disk_size`  | Root EBS volume (GiB) for its nodes   | `30`                |
+| `karpenter_chart_version` | Karpenter Helm chart version        | `1.14.0`            |
+| `karpenter_namespace`   | Namespace the Karpenter controller runs in | `kube-system`  |
+| `karpenter_node_instance_categories` | Instance categories Karpenter may pick | `["c","m","r","t"]` |
+| `karpenter_node_instance_generations_min` | Minimum instance generation | `3`            |
+| `karpenter_node_capacity_types` | Capacity types Karpenter may provision | `["spot","on-demand"]` |
+| `karpenter_node_cpu_limit` | Hard vCPU ceiling for the NodePool (cost guardrail) | `32` |
+| `karpenter_node_expire_after` | Node lifetime before drain + replace | `720h`         |
+| `karpenter_node_consolidation_after` | Idle time before consolidation  | `1m`          |
+| `karpenter_node_ami_alias` | AMI alias nodes are resolved from  | `al2023@latest`     |
+| `load_balancer_controller_chart_version` | aws-load-balancer-controller chart version | `3.5.0` |
+| `load_balancer_controller_namespace` | Namespace it runs in       | `kube-system`       |
+| `load_balancer_controller_service_account` | Its service account (bound to the Pod Identity association) | `aws-load-balancer-controller` |
 
 Naming is derived in [locals.tf](locals.tf) as `<project_name>-<environment>`, e.g.
 `chamo-dev-vpc`, `chamo-dev-cluster`.
@@ -409,6 +574,9 @@ Naming is derived in [locals.tf](locals.tf) as `<project_name>-<environment>`, e
 
 - `ecr_repository_url` — registry path the deploy workflow pushes to; must match
   `image.repository` in the Helm values.
+- `cluster_access` — the Identity Center permission sets mapped to the cluster
+  (with the role ARN each resolves to) and the break-glass role/assume-policy
+  ARNs. See [10-cluster-access.tf](10-cluster-access.tf).
 - `instructions` — post-apply cheat sheet with the exact `kubectl`/`aws` commands for
   configuring kubeconfig, retrieving the Argo CD admin password, and reaching the sample
   app through the Gateway/NLB. See [outputs.tf](outputs.tf).

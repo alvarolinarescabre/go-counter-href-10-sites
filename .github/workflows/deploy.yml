@@ -9,7 +9,7 @@ name: Deploy
   workflow_dispatch:
     inputs:
       port_run_id:
-        description: "Run ID de Port"
+        description: "Port Run ID"
         required: false
         type: string
 
@@ -33,14 +33,14 @@ jobs:
       id-token: write
     steps:
 
-      # ✅ Checkout del APP (sin repository: — ya estamos en el repo correcto)
+      # ✅ Checkout of the APP (without repository: — we're already in the correct repo)
       - name: Checkout application source
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------------
-      # 1. Crear entidad deployment en Port → status: Building
+      # 1. Create deployment entity in Port → status: Building
       # ------------------------------------------------------------------
-      - name: Port | crear deployment
+      - name: Port | create deployment
         uses: port-labs/port-github-action@v1
         with:
           clientId: ${{ secrets.PORT_CLIENT_ID }}
@@ -79,11 +79,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login en ECR
+      - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Componer URI de la imagen
+      - name: Compose image URI
         run: echo "IMAGE_REPO=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
@@ -101,7 +101,7 @@ jobs:
           cache-to: type=gha,mode=max
 
 
-      - name: Port | imagen publicada
+      - name: Port | image published
         uses: port-labs/port-github-action@v1
         with:
           clientId: ${{ secrets.PORT_CLIENT_ID }}
@@ -117,9 +117,9 @@ jobs:
             }
 
       # ------------------------------------------------------------------
-      # 3. Bump del tag en el repo GitOps → status: Manifest updated
+      # 3. Bump tag in GitOps repo → status: Manifest updated
       # ------------------------------------------------------------------
-      - name: Actualizar manifiestos GitOps
+      - name: Update GitOps manifests
         run: |
           set -euo pipefail
           git clone --depth 1 \
