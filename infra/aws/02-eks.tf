@@ -117,6 +117,22 @@ module "eks" {
     "karpenter.sh/discovery" = local.karpenter_discovery_tag
   }
 
+  # The module only opens node-to-node traffic on ports 1025-65535 (plus DNS).
+  # With the VPC CNI, pods share their node's security group, so a pod on one
+  # node reaching a pod on another over a port below 1025 -- e.g. the gateway
+  # proxy to counter-api on :80 -- times out ("no healthy upstream"). Allow all
+  # traffic between nodes that carry this security group.
+  node_security_group_additional_rules = {
+    ingress_self_all = {
+      description = "Node to node all ports/protocols"
+      protocol    = "-1"
+      from_port   = 0
+      to_port     = 0
+      type        = "ingress"
+      self        = true
+    }
+  }
+
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
 

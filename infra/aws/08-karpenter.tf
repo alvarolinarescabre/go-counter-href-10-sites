@@ -124,6 +124,11 @@ resource "kubectl_manifest" "karpenter_node_pool" {
               values   = var.karpenter_node_instance_categories
             },
             {
+              key      = "kubernetes.io/arch"
+              operator = "In"
+              values   = var.karpenter_node_architectures
+            },
+            {
               key      = "karpenter.sh/capacity-type"
               operator = "In"
               values   = var.karpenter_node_capacity_types

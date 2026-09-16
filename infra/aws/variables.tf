@@ -160,7 +160,7 @@ variable "argocd_gateway_tls_certificate_arn" {
     that is gatewayParameters.tls.certificateArn in its values.yaml).
   EOT
   type        = string
-  default     = "arn:aws:acm:eu-west-1:133630512259:certificate/c0116ba9-38d4-4147-a445-b3837a83f88d"
+  default     = ""
 }
 
 variable "argocd_gateway_tls_port" {
@@ -293,6 +293,12 @@ variable "karpenter_node_instance_generations_min" {
   description = "Minimum instance generation Karpenter may pick (excludes old, slow, comparatively expensive families)."
   type        = number
   default     = 3
+}
+
+variable "karpenter_node_architectures" {
+  description = "CPU architectures Karpenter may provision. Only amd64 by default because the counter-api image is built for linux/amd64 alone; add \"arm64\" (Graviton, usually cheaper) once CI publishes a multi-arch image."
+  type        = list(string)
+  default     = ["amd64"]
 }
 
 variable "karpenter_node_capacity_types" {
