@@ -1,0 +1,42 @@
+{{- with .Values.gatewayPolicies }}
+{{- if .upstreamIdleTimeout }}
+# The app closes keep-alive connections idle for longer than its IdleTimeout
+# (60s, main.go). If Envoy picks such a connection in the same instant, the
+# request fails with a 503 (upstream_cx_destroy_remote_with_active_rq). Closing
+# them from Envoy's side first, well before the app does, removes the race.
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: BackendConfigPolicy
+metadata:
+  name: {{ include "counter-api.fullname" $ }}
+  labels:
+    {{- include "counter-api.labels" $ | nindent 4 }}
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: {{ include "counter-api.fullname" $ }}
+  commonHttpProtocolOptions:
+    idleTimeout: {{ .upstreamIdleTimeout }}
+{{- end }}
+{{- if and .retry.enabled $.Values.httpRoute.enabled }}
+---
+# Every route is a GET, so retrying on a connection-level failure is safe. It
+# covers the cases the idle timeout cannot: a pod killed abruptly, or a spot
+# node reclaimed with requests in flight.
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: {{ include "counter-api.fullname" $ }}
+  labels:
+    {{- include "counter-api.labels" $ | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ include "counter-api.fullname" $ }}
+  retry:
+    attempts: {{ .retry.attempts }}
+    retryOn:
+      {{- toYaml .retry.retryOn | nindent 6 }}
+{{- end }}
+{{- end }}

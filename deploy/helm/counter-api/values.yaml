@@ -111,6 +111,16 @@ metrics:
   serviceScrape:
     enabled: true
     interval: 30s
+# kgateway policies for traffic from the Gateway proxy to the app.
+gatewayPolicies:
+  # Must stay below the app's http.Server IdleTimeout (60s).
+  upstreamIdleTimeout: 30s
+  retry:
+    enabled: true
+    attempts: 2
+    retryOn:
+      - reset
+      - connect-failure
 resources:
   requests:
     cpu: 100m

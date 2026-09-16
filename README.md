@@ -485,9 +485,14 @@ fronts it:
 - The proxy runs on Karpenter capacity because the managed system nodes are
   burstable `t3.medium`. Karpenter itself is limited to the `c`, `m`, and `r`
   families for the same reason.
+- A kgateway `BackendConfigPolicy` closes idle proxy → app connections after
+  30s, before the app's own 60s `IdleTimeout`. Otherwise Envoy can send a
+  request on a connection the app is closing, and the request returns a 503.
+- A kgateway `TrafficPolicy` retries once on `reset` or `connect-failure`. Every
+  route is a `GET`, so the retry is safe.
 
 All of this is configurable under `rollout`, `podDisruptionBudget`,
-`autoscaling`, and `gatewayParameters.proxy` in
+`autoscaling`, `gatewayParameters.proxy`, and `gatewayPolicies` in
 [`values.yaml`](deploy/helm/counter-api/values.yaml).
 
 ## Automatic deployment with GitHub Actions
@@ -593,6 +598,7 @@ All results below come from the same test: `/v1/tags` plus 10% `/v1/tags/{id}`,
 | From a laptop | 2,297 rps | 226 × 503 | 428 ms | 494 ms | 595 ms |
 | In EKS, 12 fixed pods, 1 proxy | 5000 | 93 × 503 (rollout during the step) | 1.6 ms | 2.6 ms | 9.7 ms |
 | In EKS, HPAs + zero-downtime rollouts | 5000 | 0 | 1.9 ms | 12.7 ms | 72.6 ms |
+| In EKS, proxy on Karpenter nodes, no `t` instances | 5000 | 39 × 503 (keep-alive race) | 1.4 ms | 3.2 ms | 94.8 ms |
 
 - **Application:** server-side latency (from the app's own histogram) stayed at
   p50 ≈ 25 µs and p99 ≈ 75 µs, using about 0.1 CPU per pod at 5000 rps.
@@ -601,6 +607,12 @@ All results below come from the same test: `/v1/tags` plus 10% `/v1/tags/{id}`,
 - **Third run:** its tail latency came from proxy replicas scheduled on the
   burstable system nodes, which is why the proxy is now pinned to Karpenter
   capacity.
+- **Fourth run:** at 1000 and 2500 rps, p99 dropped to 5.5 ms and 4.1 ms. At
+  5000 rps, p95 improved, but the p99 tail came from the proxy scaling out
+  2 → 5 in the middle of the step. The 39 errors were Envoy reusing keep-alive
+  connections the app had just closed for being idle
+  (`upstream_cx_destroy_remote_with_active_rq`). The upstream idle timeout and
+  retry policies described below were added as a result.
 
 ## Change application configuration
 
