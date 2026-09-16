@@ -25,5 +25,8 @@ data "aws_eks_cluster_auth" "cluster" {
 
 data "kubectl_file_documents" "kgateway_crds" {
   content = file("${path.root}/../../deploy/argocd/kgateway/standard-install.yaml")
+}
 
+data "aws_ecrpublic_authorization_token" "token" {
+  provider = aws.virginia
 }

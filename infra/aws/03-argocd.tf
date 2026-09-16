@@ -22,4 +22,7 @@ resource "helm_release" "argocd" {
     repoServer     = { replicas = 1 }
     applicationSet = { replicas = 1 }
   })]
+
+  # Wait for Load Balancer Controller to be ready
+  depends_on = [helm_release.aws_load_balancer_controller]
 }

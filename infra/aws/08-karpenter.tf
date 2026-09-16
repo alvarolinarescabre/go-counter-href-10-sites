@@ -1,30 +1,16 @@
-################################################################################
-# Karpenter
-#
-# Three layers, in dependency order:
-#   1. module.karpenter  -- the AWS side: controller IAM role (via Pod Identity),
-#      node IAM role + instance profile, cluster access entry for those nodes,
-#      and the SQS queue/EventBridge rules that let Karpenter drain instances
-#      ahead of a spot interruption or scheduled maintenance.
-#   2. helm_release       -- the controller itself, on the managed node group.
-#   3. EC2NodeClass/NodePool -- what Karpenter is actually allowed to launch.
-################################################################################
-
 module "karpenter" {
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"
-  version = "~> 21.3"
+  version = "21.25.0"
 
   cluster_name = module.eks.cluster_name
 
-  namespace       = var.karpenter_namespace
-  service_account = "karpenter"
+  # Name needs to match role name passed to the EC2NodeClass
+  node_iam_role_use_name_prefix   = false
+  node_iam_role_name              = "${local.name}-karpenter-node"
+  create_pod_identity_association = true
+  enable_inline_policy            = true
 
-  # Spot interruption / rebalance / instance-stop notices land on an SQS queue
-  # the controller polls, so it can cordon and drain before EC2 pulls the node.
-  enable_spot_termination = true
-
-  # SSM lets the nodes be reached without SSH and without a bastion; the CNI
-  # policy the module attaches by default covers everything else they need.
+  # Used to attach additional IAM policies to the Karpenter node IAM role
   node_iam_role_additional_policies = {
     AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
   }
@@ -36,94 +22,77 @@ module "karpenter" {
   }
 }
 
-resource "helm_release" "karpenter" {
-  name      = "karpenter"
-  namespace = var.karpenter_namespace
-
-  # Karpenter ships as an OCI artifact, not from a classic Helm repo, so the
-  # registry URL goes in `chart` and `repository` stays unset.
-  chart   = "oci://public.ecr.aws/karpenter/karpenter"
-  version = var.karpenter_chart_version
-
-  wait    = true
-  timeout = 600
-
-  values = [yamlencode({
-    settings = {
-      clusterName       = module.eks.cluster_name
-      clusterEndpoint   = module.eks.cluster_endpoint
-      interruptionQueue = module.karpenter.queue_name
-    }
-
-    # The IAM role is attached through the Pod Identity association the module
-    # creates, which keys off this exact service account name -- so the chart
-    # must not annotate it with an IRSA role as well.
-    serviceAccount = {
-      name = module.karpenter.service_account
-    }
-
-    # Two replicas so a single node going away does not leave the cluster
-    # without a provisioner; they lease-elect, only one is active.
-    replicas = 2
-
-    controller = {
-      resources = {
-        requests = { cpu = "0.5", memory = "512Mi" }
-        limits   = { memory = "512Mi" }
-      }
-    }
-  })]
-
-  depends_on = [module.eks]
+# EC2 needs the account-wide Spot service-linked role before it will launch a
+# spot instance, and the Karpenter controller role is not allowed to create it
+# on the fly (AuthFailure.ServiceLinkedRoleCreationNotPermitted). Only created
+# when spot is one of the allowed capacity types.
+resource "aws_iam_service_linked_role" "spot" {
+  count            = contains(var.karpenter_node_capacity_types, "spot") ? 1 : 0
+  aws_service_name = "spot.amazonaws.com"
 }
 
-# Same Helm-CRD-then-CR race as time_sleep.wait_for_argocd_crds in
-# 04-ingress-controller.tf: helm_release returning only means the chart's pods
-# are up, not that the karpenter.sh/v1 and karpenter.k8s.aws/v1 CRDs it ships
-# are discoverable through the API server yet. The two manifests below are CRs
-# of exactly those kinds.
+resource "helm_release" "karpenter" {
+  namespace           = "kube-system"
+  name                = "karpenter"
+  repository          = "oci://public.ecr.aws/karpenter"
+  repository_username = data.aws_ecrpublic_authorization_token.token.user_name
+  repository_password = data.aws_ecrpublic_authorization_token.token.password
+  chart               = "karpenter"
+  version             = "1.2.0"
+  wait                = false
+
+  values = [
+    <<-EOT
+    dnsPolicy: Default
+    settings:
+      clusterName: ${module.eks.cluster_name}
+      clusterEndpoint: ${module.eks.cluster_endpoint}
+      interruptionQueue: ${module.karpenter.queue_name}
+    webhook:
+      enabled: false
+    EOT
+  ]
+
+  depends_on = [module.karpenter]
+}
+
+# Wait for Karpenter CRDs to be registered before creating EC2NodeClass and NodePool
 resource "time_sleep" "wait_for_karpenter_crds" {
   depends_on      = [helm_release.karpenter]
   create_duration = "30s"
 }
 
-# The AMI, subnets, security group, disk and IAM identity of anything Karpenter
-# launches. Subnets and security group are matched by the karpenter.sh/discovery
-# tag set in 01-vpc.tf and 02-eks.tf rather than by ID, so this survives the VPC
-# being rebuilt.
-resource "kubectl_manifest" "karpenter_node_class" {
+# EC2NodeClass defines the AMI, subnets, security group, and IAM role for Karpenter nodes
+resource "kubectl_manifest" "karpenter_ec2_node_class" {
   yaml_body = yamlencode({
     apiVersion = "karpenter.k8s.aws/v1"
     kind       = "EC2NodeClass"
     metadata = {
-      name = local.karpenter_node_class
+      name = "default"
     }
     spec = {
-      amiSelectorTerms = [{ alias = var.karpenter_node_ami_alias }]
-      role             = module.karpenter.node_iam_role_name
+      amiSelectorTerms = [
+        { alias = var.karpenter_node_ami_alias }
+      ]
+      role = module.karpenter.node_iam_role_name
 
-      subnetSelectorTerms = [{
-        tags = { "karpenter.sh/discovery" = local.karpenter_discovery_tag }
-      }]
-
-      securityGroupSelectorTerms = [{
-        tags = { "karpenter.sh/discovery" = local.karpenter_discovery_tag }
-      }]
-
-      blockDeviceMappings = [{
-        deviceName = "/dev/xvda"
-        ebs = {
-          volumeSize          = "50Gi"
-          volumeType          = "gp3"
-          encrypted           = true
-          deleteOnTermination = true
+      subnetSelectorTerms = [
+        {
+          tags = {
+            "karpenter.sh/discovery" = local.karpenter_discovery_tag
+          }
         }
-      }]
+      ]
+
+      securityGroupSelectorTerms = [
+        {
+          tags = {
+            "karpenter.sh/discovery" = local.karpenter_discovery_tag
+          }
+        }
+      ]
 
       tags = {
-        Environment              = var.environment
-        Terraform                = "true"
-        Project                  = "Chamo"
         "karpenter.sh/discovery" = local.karpenter_discovery_tag
       }
     }
@@ -132,30 +101,22 @@ resource "kubectl_manifest" "karpenter_node_class" {
   depends_on = [time_sleep.wait_for_karpenter_crds]
 }
 
-# What Karpenter may provision, and when it takes capacity back. `limits` is the
-# hard ceiling -- Karpenter stops adding nodes once the pool's requests reach
-# it, leaving pods Pending rather than growing the bill without bound.
+# NodePool defines what Karpenter can provision and consolidation policies
 resource "kubectl_manifest" "karpenter_node_pool" {
   yaml_body = yamlencode({
     apiVersion = "karpenter.sh/v1"
     kind       = "NodePool"
     metadata = {
-      name = local.karpenter_node_pool
+      name = "default"
     }
     spec = {
       template = {
-        metadata = {
-          labels = { "role" = "workload" }
-        }
         spec = {
           nodeClassRef = {
             group = "karpenter.k8s.aws"
             kind  = "EC2NodeClass"
-            name  = local.karpenter_node_class
+            name  = "default"
           }
-
-          expireAfter = var.karpenter_node_expire_after
-
           requirements = [
             {
               key      = "karpenter.k8s.aws/instance-category"
@@ -163,36 +124,82 @@ resource "kubectl_manifest" "karpenter_node_pool" {
               values   = var.karpenter_node_instance_categories
             },
             {
-              key      = "karpenter.k8s.aws/instance-generation"
-              operator = "Gt"
-              values   = [tostring(var.karpenter_node_instance_generations_min - 1)]
-            },
-            {
-              key      = "kubernetes.io/arch"
-              operator = "In"
-              values   = ["amd64"]
-            },
-            {
               key      = "karpenter.sh/capacity-type"
               operator = "In"
               values   = var.karpenter_node_capacity_types
             },
+            {
+              key      = "karpenter.k8s.aws/instance-cpu"
+              operator = "In"
+              values   = ["4", "8", "16", "32"]
+            },
+            {
+              key      = "karpenter.k8s.aws/instance-hypervisor"
+              operator = "In"
+              values   = ["nitro"]
+            },
+            {
+              key      = "karpenter.k8s.aws/instance-generation"
+              operator = "Gt"
+              values   = [tostring(var.karpenter_node_instance_generations_min - 1)]
+            }
           ]
         }
-      }
-
-      # WhenEmptyOrUnderutilized also reclaims nodes whose pods would fit
-      # elsewhere, not just fully empty ones -- that is where the savings are.
-      disruption = {
-        consolidationPolicy = "WhenEmptyOrUnderutilized"
-        consolidateAfter    = var.karpenter_node_consolidation_after
       }
 
       limits = {
         cpu = var.karpenter_node_cpu_limit
       }
+
+      disruption = {
+        consolidationPolicy = "WhenEmpty"
+        consolidateAfter    = var.karpenter_node_consolidation_after
+      }
     }
   })
 
-  depends_on = [kubectl_manifest.karpenter_node_class]
+  depends_on = [kubectl_manifest.karpenter_ec2_node_class, aws_iam_service_linked_role.spot]
 }
+
+# Sample workload to exercise Karpenter scaling: 5 pause pods requesting 1 CPU each
+# resource "kubectl_manifest" "karpenter_inflate" {
+#   yaml_body = yamlencode({
+#     apiVersion = "apps/v1"
+#     kind       = "Deployment"
+#     metadata = {
+#       name      = "inflate"
+#       namespace = "default"
+#     }
+#     spec = {
+#       replicas = 5
+#       selector = {
+#         matchLabels = {
+#           app = "inflate"
+#         }
+#       }
+#       template = {
+#         metadata = {
+#           labels = {
+#             app = "inflate"
+#           }
+#         }
+#         spec = {
+#           terminationGracePeriodSeconds = 0
+#           containers = [
+#             {
+#               name  = "inflate"
+#               image = "public.ecr.aws/eks-distro/kubernetes/pause:3.7"
+#               resources = {
+#                 requests = {
+#                   cpu = "1"
+#                 }
+#               }
+#             }
+#           ]
+#         }
+#       }
+#     }
+#   })
+
+#   depends_on = [kubectl_manifest.karpenter_node_pool]
+# }
