@@ -23,9 +23,11 @@ var (
 	}, []string{"method", "route", "status"})
 
 	httpRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "counter_api_http_request_duration_seconds",
-		Help:    "Time spent serving an HTTP request, by method and route template.",
-		Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1},
+		Name: "counter_api_http_request_duration_seconds",
+		Help: "Time spent serving an HTTP request, by method and route template.",
+		// Starts at 50µs: the cached read path answers in well under 1ms, and
+		// with a 0.5ms first bucket every quantile collapsed to 0.
+		Buckets: []float64{.00005, .0001, .00025, .0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1},
 	}, []string{"method", "route"})
 
 	refreshesTotal = promauto.NewCounterVec(prometheus.CounterOpts{

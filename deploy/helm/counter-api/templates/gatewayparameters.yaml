@@ -25,4 +25,48 @@ spec:
     service:
       extraAnnotations:
         {{- toYaml $annotations | nindent 8 }}
+    {{- with .Values.gatewayParameters.proxy }}
+    {{- with .resources }}
+    envoyContainer:
+      resources:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    podTemplate:
+      # Drain listeners before Envoy exits, so an HPA scale-down or a node
+      # replacement does not reset in-flight connections.
+      gracefulShutdown:
+        enabled: true
+        sleepTimeSeconds: {{ .gracefulShutdownSeconds }}
+      terminationGracePeriodSeconds: {{ add .gracefulShutdownSeconds 20 }}
+      # Replicas on different nodes: one node (or one spot reclaim) must not
+      # take the whole gateway down.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              gateway.networking.k8s.io/gateway-name: {{ $.Values.gateway.name }}
+    {{- if .autoscaling.enabled }}
+    # kgateway creates this HPA itself and points it at the proxy
+    # Deployment. deployment.replicas is deliberately left unset so the two do
+    # not fight over the replica count.
+    horizontalPodAutoscaler:
+      spec:
+        minReplicas: {{ .autoscaling.minReplicas }}
+        maxReplicas: {{ .autoscaling.maxReplicas }}
+        metrics:
+          - type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: {{ .autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- with .podDisruptionBudget }}
+    podDisruptionBudget:
+      spec:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- end }}
 {{- end }}

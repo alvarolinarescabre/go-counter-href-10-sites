@@ -71,6 +71,10 @@ module "eks" {
       before_compute = true
     }
     coredns = {}
+    # Serves the resource metrics API (CPU/memory per pod) that every
+    # HorizontalPodAutoscaler reads -- counter-api's and its gateway proxy's.
+    # Without it the HPAs exist but never scale ("unable to get metrics").
+    metrics-server = {}
     # Provisions the EBS volumes behind PersistentVolumeClaims (VMSingle,
     # Grafana). Its IAM role lives in 11-monitoring.tf.
     aws-ebs-csi-driver = {

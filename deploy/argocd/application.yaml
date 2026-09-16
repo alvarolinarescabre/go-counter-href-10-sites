@@ -13,9 +13,19 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: counter-api
+  # The chart's HPA owns the replica count (the Deployment renders no
+  # spec.replicas). Without this, Argo CD's apply removes the field it used to
+  # set, the API server defaults it to 1, and every pod but one is killed
+  # before the HPA reacts; selfHeal would also keep "fixing" HPA scaling.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+      - RespectIgnoreDifferences=true

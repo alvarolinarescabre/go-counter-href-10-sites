@@ -6,7 +6,14 @@ metadata:
     {{- include "counter-api.labels" . | nindent 4 }}
 spec:
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.rollout.maxSurge }}
+      maxUnavailable: {{ .Values.rollout.maxUnavailable }}
   selector:
     matchLabels:
       {{- include "counter-api.selectorLabels" . | nindent 6 }}
@@ -15,6 +22,8 @@ spec:
       labels:
         {{- include "counter-api.selectorLabels" . | nindent 8 }}
     spec:
+      # Must cover the preStop sleep plus the app's own 10s graceful shutdown.
+      terminationGracePeriodSeconds: {{ .Values.rollout.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
       containers:
@@ -37,12 +46,22 @@ spec:
             {{- end }}
             - name: CACHE_DB_PATH
               value: /tmp/sqlite_cache.db
+          {{- if .Values.rollout.preStopSleepSeconds }}
+          # A terminating pod leaves the EndpointSlice at the same moment it gets
+          # SIGTERM, but the gateway proxy only learns about it a few seconds
+          # later. Keep serving meanwhile, or requests still routed here get a
+          # 503. Native sleep action: the image is FROM scratch, with no shell.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.rollout.preStopSleepSeconds }}
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /healthcheck
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            initialDelaySeconds: 2
+            periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthcheck

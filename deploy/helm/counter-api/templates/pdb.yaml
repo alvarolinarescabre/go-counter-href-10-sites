@@ -1,0 +1,15 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Caps voluntary evictions (Karpenter consolidation and spot replacement, node
+# drains) so they never take out more than this share of the pods at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "counter-api.fullname" . }}
+  labels:
+    {{- include "counter-api.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "counter-api.selectorLabels" . | nindent 6 }}
+{{- end }}

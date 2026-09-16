@@ -1,5 +1,24 @@
+# Fixed replica count, only used when autoscaling.enabled is false.
 replicaCount: 24
+# CPU-based HPA (needs metrics-server). Utilization is measured against
+# resources.requests.cpu. At 5000 rps the pods used ~0.1 core each, so the
+# floor handles normal traffic and the ceiling matches the old fixed count.
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 24
+  targetCPUUtilizationPercentage: 70
 revisionHistoryLimit: 2
+# Zero-downtime rollouts: new pods must be Ready before an old one is removed,
+# and a removed pod keeps serving until the gateway has stopped routing to it.
+rollout:
+  maxSurge: 25%
+  maxUnavailable: 0
+  preStopSleepSeconds: 10
+  terminationGracePeriodSeconds: 30
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 25%
 image:
   # Must match `terraform output ecr_repository_url` from infra/aws. Nodes pull
   # it with their own node IAM role, so there is no imagePullSecret.
@@ -57,6 +76,24 @@ gatewayParameters:
     # Frontend ports that terminate TLS. Everything else stays plain HTTP.
     ports: "443"
     negotiationPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+  # The Envoy proxy kgateway runs for the Gateway. In the 5000 rps test it was
+  # the busiest component (~0.85 core) and ran as a single replica.
+  proxy:
+    resources:
+      # No CPU limit: throttling a proxy adds latency to every request.
+      requests:
+        cpu: 500m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    podDisruptionBudget:
+      minAvailable: 1
+    gracefulShutdownSeconds: 10
 metrics:
   # Serve Prometheus metrics on their own port (never routed by the Gateway).
   enabled: true
