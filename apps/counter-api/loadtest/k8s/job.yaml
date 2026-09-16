@@ -1,0 +1,76 @@
+# In-cluster load test: runs loadgen (../loadgen/main.go, mounted from a
+# ConfigMap and compiled at start, so no image has to be built or pushed)
+# against the public URL, through the real NLB -> kgateway -> counter-api path,
+# without a home uplink capping the rate. Launch it with ./run.sh.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: counter-api-loadtest
+  namespace: loadtest
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: counter-api-loadtest
+    spec:
+      restartPolicy: Never
+      # Karpenter capacity only, and never next to the app or its gateway: the
+      # generator must not steal CPU from what it is measuring.
+      nodeSelector:
+        karpenter.sh/nodepool: default
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              namespaceSelector: {}
+              labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: [counter-api]
+            - topologyKey: kubernetes.io/hostname
+              namespaceSelector: {}
+              labelSelector:
+                matchExpressions:
+                  - key: gateway.networking.k8s.io/gateway-name
+                    operator: Exists
+      containers:
+        - name: loadgen
+          image: public.ecr.aws/docker/library/golang:1.26-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              export HOME=/tmp GOCACHE=/tmp/gocache
+              go build -o /tmp/loadgen /src/main.go || exit 2
+              for rate in $STEPS; do
+                echo "===== $rate rps / $STEP_DURATION ($(date -u +%T) UTC) ====="
+                /tmp/loadgen -url "$TARGET_URL" -rate "$rate" -duration "$STEP_DURATION" -workers "$WORKERS"
+                echo "exit=$?"
+              done
+          env:
+            - name: TARGET_URL
+              value: http://counter-api.alvarolinarescabre.com
+            - name: STEPS
+              value: "1000 2500 5000"
+            - name: STEP_DURATION
+              value: 2m
+            - name: WORKERS
+              value: "1024"
+            - name: GOMAXPROCS
+              value: "4"
+          resources:
+            requests:
+              cpu: "3"
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: src
+              mountPath: /src
+      volumes:
+        - name: src
+          configMap:
+            name: loadgen-src
