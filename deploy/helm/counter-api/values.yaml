@@ -90,7 +90,14 @@ gatewayParameters:
       enabled: true
       minReplicas: 2
       maxReplicas: 6
-      targetCPUUtilizationPercentage: 70
+      # Lower than the app's 70%: a new proxy replica takes a while to start
+      # and join the NLB, so it has to be requested before the pods are hot.
+      targetCPUUtilizationPercentage: 50
+    # Keep the proxy off the managed system nodes (burstable t3, shared with
+    # Argo CD, Karpenter, CoreDNS...): in the 5000 rps test the replicas that
+    # landed there drove p99 from ~10ms to ~70ms.
+    nodeSelector:
+      karpenter.sh/nodepool: default
     podDisruptionBudget:
       minAvailable: 1
     gracefulShutdownSeconds: 10

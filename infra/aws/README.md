@@ -570,7 +570,7 @@ already exists.
 | `node_group_disk_size`  | Root EBS volume (GiB) for its nodes   | `30`                |
 | `karpenter_chart_version` | Karpenter Helm chart version        | `1.14.0`            |
 | `karpenter_namespace`   | Namespace the Karpenter controller runs in | `kube-system`  |
-| `karpenter_node_instance_categories` | Instance categories Karpenter may pick | `["c","m","r","t"]` |
+| `karpenter_node_instance_categories` | Instance categories Karpenter may pick (no burstable `t`) | `["c","m","r"]` |
 | `karpenter_node_instance_generations_min` | Minimum instance generation | `3`            |
 | `karpenter_node_architectures` | CPU architectures Karpenter may pick (image is amd64-only) | `["amd64"]` |
 | `karpenter_node_capacity_types` | Capacity types Karpenter may provision | `["spot","on-demand"]` |

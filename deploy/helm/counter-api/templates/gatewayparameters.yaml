@@ -32,6 +32,10 @@ spec:
         {{- toYaml . | nindent 8 }}
     {{- end }}
     podTemplate:
+      {{- with .nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       # Drain listeners before Envoy exits, so an HPA scale-down or a node
       # replacement does not reset in-flight connections.
       gracefulShutdown:

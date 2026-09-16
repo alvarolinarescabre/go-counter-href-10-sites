@@ -284,9 +284,9 @@ variable "karpenter_namespace" {
 }
 
 variable "karpenter_node_instance_categories" {
-  description = "Instance categories Karpenter may pick from for the nodes it provisions."
+  description = "Instance categories Karpenter may pick from for the nodes it provisions. No \"t\": burstable instances run out of CPU credits under sustained load and add latency spikes."
   type        = list(string)
-  default     = ["c", "m", "r", "t"]
+  default     = ["c", "m", "r"]
 }
 
 variable "karpenter_node_instance_generations_min" {
