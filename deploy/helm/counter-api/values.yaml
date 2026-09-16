@@ -22,7 +22,7 @@ gateway:
   # listener protocol is HTTP -- there is no certificate inside the cluster.
   # Requires gatewayParameters.tls.certificateArn.
   https:
-    enabled: true
+    enabled: false
     listenerName: https
     port: 443
 httpRoute:
@@ -33,7 +33,6 @@ httpRoute:
     # to every listener the Gateway exposes.
     sectionNames:
       - http
-      - https
   # Leave empty (hostnames: []) to match any Host header, which lets you reach
   # the app straight on the Gateway's NLB DNS name with no domain of your own.
   # Only one hostname-less route can own "/" on a given Gateway listener.
@@ -53,7 +52,8 @@ gatewayParameters:
     # live in the same region as the cluster and cover the httpRoute hostnames.
     # Setting this adds the aws-load-balancer-ssl-* annotations; it is required
     # by gateway.https.enabled.
-    certificateArn: "arn:aws:acm:eu-west-1:133630512259:certificate/c0116ba9-38d4-4147-a445-b3837a83f88d"
+    # TODO: Create ACM certificate and update this ARN, then set gateway.https.enabled: true
+    certificateArn: ""
     # Frontend ports that terminate TLS. Everything else stays plain HTTP.
     ports: "443"
     negotiationPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
