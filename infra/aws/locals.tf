@@ -48,8 +48,13 @@ locals {
       policy_associations = {
         (v.access_policy) = {
           policy_arn = local.eks_access_policy_arns[v.access_policy]
-          access_scope = v.namespaces == null ? { type = "cluster" } : {
-            type       = "namespace"
+          # Both branches have to produce the SAME object type -- a
+          # conditional whose arms differ in their attributes is a plan-time
+          # error, not a null. Hence `namespaces` always present, null for a
+          # cluster-scoped grant; the EKS module declares it optional and
+          # passes it through as null.
+          access_scope = {
+            type       = v.namespaces == null ? "cluster" : "namespace"
             namespaces = v.namespaces
           }
         }
