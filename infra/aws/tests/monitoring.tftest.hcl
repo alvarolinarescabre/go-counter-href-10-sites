@@ -271,6 +271,44 @@ run "components_that_would_only_burn_capacity_are_off" {
   }
 }
 
+# The parent chart enables the operator's CRD cleanup hook (the operator
+# subchart defaults it off), and it cannot work at this release name: the hook
+# Job is <release>-victoria-metrics-operator-cleanup-hook, 65 characters, and
+# Kubernetes copies that into the pod template's automatic `job-name` label,
+# where a value may not exceed 63 bytes. The API server rejects the Job, Argo
+# CD retries the PreDelete hook forever, and the Application never finishes
+# terminating -- which with `wait = true` fails the destroy outright.
+run "the_crd_cleanup_hook_that_cannot_run_is_off" {
+  command = apply
+
+  assert {
+    condition     = local.victoria_metrics_k8s_stack_values["victoria-metrics-operator"].crds.cleanup.enabled == false
+    error_message = "The operator's CRD cleanup hook is on again; its Job name exceeds the 63-byte label limit at this release name and deadlocks the Application delete."
+  }
+
+  # The release name is what makes the hook name too long, so a rename is the
+  # other way out of this -- and would silently rename the Grafana secret that
+  # the ignoreDifferences entry and outputs.tf both refer to by name.
+  assert {
+    condition     = yamldecode(kubectl_manifest.victoria_metrics_k8s_stack[0].yaml_body).metadata.name == "victoria-metrics-k8s-stack"
+    error_message = "The release name changed. Re-check the hook name length, the Grafana secret name in ignoreDifferences, and outputs.tf."
+  }
+}
+
+# VMSingle and VMAgent carry apps.victoriametrics.com/finalizer and only the
+# operator clears it. Argo CD's prune has no ordering of its own, so without
+# this it removed the operator alongside the custom resources it was supposed
+# to finalize -- wedging the namespace, and through it the Grafana NLB, the
+# internet gateway detach and the subnet deletes.
+run "the_operator_is_pruned_after_the_resources_it_finalizes" {
+  command = apply
+
+  assert {
+    condition     = local.victoria_metrics_k8s_stack_values["victoria-metrics-operator"].annotations["argocd.argoproj.io/sync-options"] == "PruneLast=true"
+    error_message = "Without PruneLast the operator can be pruned before VMSingle/VMAgent, leaving apps.victoriametrics.com/finalizer with nothing left alive to clear it."
+  }
+}
+
 run "argocd_application_is_configured_for_the_charts_quirks" {
   command = apply
 

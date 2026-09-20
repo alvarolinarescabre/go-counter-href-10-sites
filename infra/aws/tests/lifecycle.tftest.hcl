@@ -327,6 +327,33 @@ run "the_teardown_wait_is_tunable" {
 # The barrier only helps if the controller is actually still installed when the
 # Gateways are deleted, which is what the depends_on chain guarantees. The
 # chart being present at all is the precondition for any of it.
+# The load balancer controller watches the Gateway API CRDs (ListenerSet,
+# TLSRoute, GRPCRoute, TCPRoute). Deleting them out from under it stops its
+# manager syncing its caches, its Service reconciler never runs, and the
+# service.k8s.aws/resources finalizers are never cleared -- so the NLBs survive
+# and take the subnet deletes and the internet gateway detach down with them.
+#
+# This is not assertable as an attribute; `depends_on` is the mechanism, and
+# the graph is where it lives. See "What the tests can and cannot see".
+# What CAN be pinned is that the two resources still exist to be ordered.
+run "the_gateway_api_crds_outlive_the_controller_that_watches_them" {
+  command = apply
+
+  # kubectl_manifest.kgateway_crds itself has zero instances here: the mocked
+  # kubectl_file_documents returns no manifests, so the for_each is empty. What
+  # is still observable is that the CRD bundle the controller's watches depend
+  # on is the one being read.
+  assert {
+    condition     = strcontains(data.kubectl_file_documents.kgateway_crds.content, "listenersets.gateway.networking.k8s.io")
+    error_message = "The Gateway API bundle no longer defines ListenerSet, which the load balancer controller starts an informer for -- its caches will never sync."
+  }
+
+  assert {
+    condition     = helm_release.aws_load_balancer_controller.version == var.load_balancer_controller_chart_version
+    error_message = "The controller chart version no longer tracks its variable -- re-check which Gateway API kinds the new version watches."
+  }
+}
+
 run "the_controller_that_deletes_the_nlbs_is_installed" {
   command = apply
 

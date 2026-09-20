@@ -113,8 +113,26 @@ resource "helm_release" "aws_load_balancer_controller" {
   # away mid-drain, every controller went Pending, and the NodeClaim finalizers
   # that only Karpenter can clear were left with no Karpenter to clear them.
   # A depends_on over the whole module covers its node group too.
+  #
+  # kgateway_crds are the upstream Gateway API CRDs, and this controller WATCHES
+  # them: v3.5.0 starts informers for ListenerSet, TLSRoute, GRPCRoute and
+  # TCPRoute in gateway.networking.k8s.io. Delete those CRDs while it is running
+  # and its manager cannot sync its caches:
+  #
+  #   Failed to watch *v1.ListenerSet: the server could not find the requested
+  #   resource (get listenersets.gateway.networking.k8s.io)
+  #
+  # A controller whose caches never sync never runs its Service reconciler --
+  # so it never clears service.k8s.aws/resources, and the NLBs behind those
+  # Services are never deleted. Their ENIs then fail the subnet deletes and
+  # their public addresses fail the internet gateway detach.
+  #
+  # Depending on the CRDs puts them after this release on destroy, so they
+  # outlive it. On create it is the right order too: without them present at
+  # startup the controller logs those same watch errors.
   depends_on = [
     module.eks,
+    kubectl_manifest.kgateway_crds,
     aws_eks_pod_identity_association.aws_load_balancer_controller,
     aws_iam_role_policy_attachment.aws_load_balancer_controller,
   ]

@@ -510,6 +510,171 @@ Application deleted  (wait: blocks on the Argo CD finalizer -> chart pruned,
 Only the last link is asynchronous, and `var.storage_teardown_wait` is the
 margin around it. Raise it if a destroy still leaves `available` volumes.
 
+### When an Application will not finish terminating
+
+`wait = true` on an Argo CD `Application` turns a silent orphan into a visible
+failure, which is the trade it is there to make — but it does mean a stuck
+finalizer now fails the destroy:
+
+```text
+Error: victoria-metrics-k8s-stack failed to delete resource
+```
+
+An `Application` can carry more than the one finalizer this README talks about.
+When the chart ships `PreDelete` hooks it also gets
+`pre-delete-finalizer.argocd.argoproj.io` and `.../cleanup`, and Argo CD will
+not clear them until those hooks have run:
+
+```bash
+kubectl get application <name> -n argocd -o jsonpath='{.metadata.finalizers}'
+kubectl -n argocd logs argocd-application-controller-0 --tail=200 | grep -i 'pre-delete\|hook'
+```
+
+That is how the `victoria-metrics-k8s-stack` case was found: the parent chart
+enables the operator's CRD cleanup hook, whose Job is named
+`<release>-victoria-metrics-operator-cleanup-hook` — 65 characters at this
+release name. Kubernetes copies a Job's name into its pod template's automatic
+`job-name` label, a label value may not exceed 63 bytes, and the API server
+rejects the Job. Argo CD retried the hook forever. `crds.cleanup.enabled` is
+now `false` in `local.victoria_metrics_k8s_stack_values`.
+
+### The instance profile Terraform never sees
+
+An `EC2NodeClass` with `spec.role` does not use an instance profile you gave
+it — it makes **Karpenter create one**, named `<cluster>_<hash>`, and manage it.
+Terraform has no resource for it and cannot delete it. Only Karpenter does, and
+only when the `EC2NodeClass` is deleted, so a teardown where Karpenter died
+first leaves it behind.
+
+That is a slow-acting trap, because `node_iam_role_use_name_prefix = false`
+keeps the node role's name stable across rebuilds. The stale profile latches
+onto the freshly created role, and the destroy *after that* fails on something
+that names neither Karpenter nor the profile:
+
+```text
+Failed deleting role chamo-dev-karpenter-node.
+Cannot delete entity, must remove roles from instance profile first.
+```
+
+`create_instance_profile = true` on the karpenter module plus
+`spec.instanceProfile` on the `EC2NodeClass` moves ownership to Terraform:
+Karpenter creates no shadow profile, and the real one is destroyed in order.
+
+To clear one that is already stranded:
+
+```bash
+aws iam list-instance-profiles-for-role --role-name <cluster>-karpenter-node
+aws iam remove-role-from-instance-profile \
+  --instance-profile-name <name> --role-name <cluster>-karpenter-node
+aws iam delete-instance-profile --instance-profile-name <name>
+```
+
+### When a controller's CRDs are deleted out from under it
+
+The AWS Load Balancer Controller does not only reconcile `Service` objects. From
+v3.5.0 it also starts informers for the Gateway API kinds — `ListenerSet`,
+`TLSRoute`, `GRPCRoute`, `TCPRoute` in `gateway.networking.k8s.io`. Those CRDs
+are `kubectl_manifest.kgateway_crds`, a Terraform resource, and nothing used to
+stop Terraform deleting them while the controller was still running:
+
+```
+Failed to watch *v1.ListenerSet: the server could not find the requested
+resource (get listenersets.gateway.networking.k8s.io)
+```
+
+controller-runtime will not start a manager whose caches cannot sync, so the
+**Service reconciler never runs**. `service.k8s.aws/resources` is never cleared,
+the three NLBs behind those Services are never deleted, and the destroy ends in
+errors that point at the VPC rather than at the controller:
+
+```text
+Error: deleting EC2 Internet Gateway (...): DependencyViolation: Network
+       vpc-... has some mapped public address(es)
+Error: deleting EC2 Subnet (...): DependencyViolation
+```
+
+`helm_release.aws_load_balancer_controller` now `depends_on` the CRDs, which
+puts them *after* it on destroy. It is the right order on create too: without
+them present at startup the controller logs the same watch errors.
+
+**The general rule, and it has now bitten three different ways in this stack:
+whatever a controller needs in order to do its cleanup — its nodes, its CRDs,
+its operator — has to be destroyed after it, and only an explicit `depends_on`
+says so.** A reference to a module output does not.
+
+To unwedge a cluster already in this state, put the CRDs back so the controller
+can sync, then delete the Services and let it do its job:
+
+```bash
+kubectl apply --server-side -f deploy/argocd/kgateway/standard-install.yaml
+kubectl -n kube-system rollout restart deploy/aws-load-balancer-controller
+kubectl delete svc -n argocd argocd-gateway
+kubectl delete svc -n counter-api public-nlb-gateway
+kubectl delete svc -n monitoring grafana-gateway
+```
+
+If the controller cannot be revived, delete the load balancers through the AWS
+API and strip `service.k8s.aws/resources` from the Services by hand — the NLBs
+are what the VPC is actually waiting on.
+
+### When an operator is pruned before the resources it finalizes
+
+The other half of the same problem, and the one that produces the most
+confusing error list. Argo CD's prune has **no ordering of its own**: it can
+remove an operator's Deployment alongside the custom resources that operator is
+supposed to finalize. Those CRs then delete forever, because nothing left in
+the cluster can clear their finalizer.
+
+```
+$ kubectl get ns monitoring -o jsonpath='{.status.conditions[*].message}'
+Some content in the namespace has finalizers remaining:
+apps.victoriametrics.com/finalizer in 2 resource instances
+```
+
+From there it cascades into errors that name none of the above:
+
+```text
+Error: default failed to delete resource        # the Karpenter NodePool
+Error: monitoring failed to delete resource     # the namespace
+Error: deleting EC2 Internet Gateway (...): DependencyViolation: Network
+       vpc-... has some mapped public address(es)
+Error: deleting EC2 Subnet (...): DependencyViolation
+```
+
+The chain: the CRs hold the namespace in `Terminating`, the namespace holds the
+Grafana `Service`, so the load balancer controller never deletes its NLB, the
+still-mapped public addresses block the internet gateway detach, and the
+subnets fail behind it.
+
+`victoria-metrics-operator.annotations` now carries
+`argocd.argoproj.io/sync-options: PruneLast=true`, which holds the operator
+back until everything else is pruned — the window its finalizers need. **Any
+operator-backed chart added here needs the same treatment**; the symptom is
+always a namespace stuck on a finalizer whose controller is already gone.
+
+To unwedge one that is already stuck, strip the finalizer from the custom
+resources — the operator that would have done it is gone, and the namespace
+delete removes the children it would have cleaned up anyway:
+
+```bash
+# kubectl patch takes no --all: feed it the names.
+kubectl get vmsingle,vmagent -n monitoring -o name \
+  | xargs -r -I{} kubectl patch {} -n monitoring \
+      --type=merge -p '{"metadata":{"finalizers":null}}'
+```
+
+**To get out of an Application stuck on its own finalizers**, drop them and let
+the namespace delete do the real cleanup — it cascades to the PVCs, which is what the EBS volumes hang off:
+
+```bash
+kubectl patch application <name> -n argocd --type=merge \
+  -p '{"metadata":{"finalizers":null}}'
+cd infra/aws && terraform destroy
+```
+
+Anything cluster-scoped the chart left behind (CRDs, ClusterRoles) goes with
+the cluster a few minutes later.
+
 ### The compute has to outlive the controllers
 
 Karpenter, the load balancer controller and Argo CD are all *pods*. Each one
@@ -686,7 +851,7 @@ cd infra/aws
 terraform test
 ```
 
-76 tests across seven files in [`tests/`](tests). **They need no AWS credentials
+79 tests across seven files in [`tests/`](tests). **They need no AWS credentials
 and touch nothing** — every provider is replaced by a `mock_provider`, so a run
 never reaches an API, never reads or writes the S3 state, and never sees the
 real cluster. A full run takes about three minutes.

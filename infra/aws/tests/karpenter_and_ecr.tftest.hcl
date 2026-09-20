@@ -152,11 +152,20 @@ run "node_class_discovers_by_the_cluster_tag" {
     error_message = "Provisioned nodes should carry the discovery tag."
   }
 
-  # The role name, not the ARN -- and the karpenter module is told not to use a
-  # name prefix precisely so this stays predictable.
+  # instanceProfile, NOT role. `spec.role` makes Karpenter create and manage
+  # its own instance profile (<cluster>_<hash>) that Terraform never sees --
+  # only Karpenter deletes it, and a teardown where Karpenter died first leaves
+  # it holding the node role. The next apply recreates the role under the same
+  # fixed name, the stale profile latches on, and the destroy after that fails
+  # with "Cannot delete entity, must remove roles from instance profile first".
   assert {
-    condition     = yamldecode(kubectl_manifest.karpenter_ec2_node_class.yaml_body).spec.role == module.karpenter.node_iam_role_name
-    error_message = "The EC2NodeClass role must be the node IAM role the karpenter module created."
+    condition     = !can(yamldecode(kubectl_manifest.karpenter_ec2_node_class.yaml_body).spec.role)
+    error_message = "spec.role is back: Karpenter will create an instance profile Terraform cannot delete."
+  }
+
+  assert {
+    condition     = yamldecode(kubectl_manifest.karpenter_ec2_node_class.yaml_body).spec.instanceProfile == module.karpenter.instance_profile_name
+    error_message = "The EC2NodeClass must point at the instance profile the karpenter module owns, or Terraform is not the one deleting it."
   }
 
   assert {

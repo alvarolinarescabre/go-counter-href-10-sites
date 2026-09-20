@@ -144,6 +144,55 @@ locals {
       # The webhook's certificate is generated with genCA on every chart
       # render, which Argo CD would see as permanent drift.
       admissionWebhooks = { enabled = false }
+
+      # The parent chart turns this on (the operator subchart defaults it off)
+      # and it cannot work at this release name. The hook Job is called
+      # <release>-victoria-metrics-operator-cleanup-hook -- 65 characters here
+      # -- and Kubernetes copies that into the pod template's automatic
+      # `job-name` label, where a value may not exceed 63 bytes. The API server
+      # rejects the Job, Argo CD retries the PreDelete hook forever, and the
+      # Application never finishes terminating:
+      #
+      #   error executing pre-delete hooks: Job.batch "...-cleanup-hook" is
+      #   invalid: spec.template.labels: Invalid value: "...": must be no more
+      #   than 63 bytes
+      #
+      # All the hook does is delete the VictoriaMetrics CRDs on uninstall. On
+      # `terraform destroy` the cluster goes anyway, so nothing is lost; the
+      # cost is that deleting only this Application on a live cluster leaves
+      # the CRDs behind, which a re-apply reuses. That is the better failure:
+      # the hook's actual job is to delete CRDs, and deleting a CRD deletes
+      # every custom resource of that kind with it.
+      #
+      # The alternative is a shorter release name, which renames every object
+      # the chart owns -- including the Grafana secret that outputs.tf and the
+      # ignoreDifferences entry below both refer to by name.
+      crds = {
+        cleanup = { enabled = false }
+      }
+
+      # Prune the operator LAST, after everything else the chart owns.
+      #
+      # VMSingle and VMAgent carry apps.victoriametrics.com/finalizer, and only
+      # the operator clears it. Argo CD's prune has no ordering of its own, so
+      # it removed the operator's Deployment alongside the custom resources it
+      # was supposed to finalize -- and the two CRs were left deleting forever,
+      # with nothing left in the cluster that could ever release them:
+      #
+      #   Some content in the namespace has finalizers remaining:
+      #   apps.victoriametrics.com/finalizer in 2 resource instances
+      #
+      # That is enough to wedge the whole teardown. A namespace cannot finish
+      # Terminating while those CRs exist, the Grafana Service goes with it so
+      # its NLB is never deleted, the still-mapped public addresses block the
+      # internet gateway detach, and the subnets then fail with
+      # DependencyViolation.
+      #
+      # PruneLast=true holds the operator back until every other resource is
+      # pruned, which is exactly the window its finalizers need.
+      annotations = {
+        "argocd.argoproj.io/sync-options" = "PruneLast=true"
+      }
     }
 
     vmsingle = {

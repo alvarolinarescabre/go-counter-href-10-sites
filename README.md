@@ -767,6 +767,8 @@ aws ec2 describe-volumes --region $R --filters Name=status,Values=available \
 aws ec2 describe-network-interfaces --region $R --filters Name=status,Values=available \
   --query 'NetworkInterfaces[].NetworkInterfaceId'
 aws ec2 describe-vpcs --region $R --query 'Vpcs[?Tags[?Value==`chamo-dev-vpc`]].VpcId'
+# Karpenter's own instance profile, which Terraform never owned:
+aws iam list-instance-profiles --query 'InstanceProfiles[?starts_with(InstanceProfileName,`chamo-dev-cluster_`)].InstanceProfileName'
 ```
 
 The VPC is the canary: if the destroy succeeded but the VPC is still there,

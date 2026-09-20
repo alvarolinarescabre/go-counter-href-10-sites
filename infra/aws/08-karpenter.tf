@@ -4,11 +4,27 @@ module "karpenter" {
 
   cluster_name = module.eks.cluster_name
 
-  # Name needs to match role name passed to the EC2NodeClass
   node_iam_role_use_name_prefix   = false
   node_iam_role_name              = "${local.name}-karpenter-node"
   create_pod_identity_association = true
   enable_inline_policy            = true
+
+  # Own the instance profile here instead of letting Karpenter make its own.
+  #
+  # An EC2NodeClass with `spec.role` makes Karpenter create and manage an
+  # instance profile named <cluster>_<hash>, which Terraform never sees. Only
+  # Karpenter deletes it, and only when the EC2NodeClass goes -- so a teardown
+  # where Karpenter died first leaves it behind, still holding this role. The
+  # role name is fixed (node_iam_role_use_name_prefix = false), so the next
+  # apply recreates the same role, the stale profile latches onto it, and the
+  # next destroy fails on something that looks unrelated:
+  #
+  #   Failed deleting role chamo-dev-karpenter-node. Cannot delete entity,
+  #   must remove roles from instance profile first.
+  #
+  # With `spec.instanceProfile` pointing at this one, Karpenter creates no
+  # shadow profile and Terraform deletes the real one in the right order.
+  create_instance_profile = true
 
   # Used to attach additional IAM policies to the Karpenter node IAM role
   node_iam_role_additional_policies = {
@@ -91,7 +107,9 @@ resource "kubectl_manifest" "karpenter_ec2_node_class" {
       amiSelectorTerms = [
         { alias = var.karpenter_node_ami_alias }
       ]
-      role = module.karpenter.node_iam_role_name
+      # Not `role`: that makes Karpenter create its own instance profile,
+      # which Terraform cannot delete. See create_instance_profile above.
+      instanceProfile = module.karpenter.instance_profile_name
 
       subnetSelectorTerms = [
         {
