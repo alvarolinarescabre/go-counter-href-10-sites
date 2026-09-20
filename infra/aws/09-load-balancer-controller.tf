@@ -85,10 +85,56 @@ resource "helm_release" "aws_load_balancer_controller" {
       create = true
       name   = var.load_balancer_controller_service_account
     }
+
+    # Off, deliberately. This webhook exists to make the controller the default
+    # for every new Service of type LoadBalancer by stamping a loadBalancerClass
+    # on it -- needed only when a Service does NOT say who should handle it.
+    #
+    # Every NLB Service here is created by kgateway from GatewayParameters that
+    # already carry `aws-load-balancer-type: external` (this repo's
+    # deploy/argocd/kgateway/parameters.yaml, the counter-api chart's values,
+    # and var.argocd_gateway_annotations), so the mutation is redundant.
+    #
+    # What it is not is harmless: the chart registers it with
+    # failurePolicy: Fail and no selector, so it intercepts EVERY Service
+    # creation in the cluster. Any moment the controller has no ready endpoints
+    # -- a rollout, a node replacement, a Karpenter consolidation -- no Service
+    # can be created anywhere. That is what breaks the Karpenter install in
+    # 08-karpenter.tf on a cold cluster.
+    enableServiceMutatorWebhook = false
   })]
 
   depends_on = [
     aws_eks_pod_identity_association.aws_load_balancer_controller,
     aws_iam_role_policy_attachment.aws_load_balancer_controller,
   ]
+}
+
+################################################################################
+# Teardown barrier
+#
+# Every NLB in this stack is created by THIS controller, in response to a
+# Service of type LoadBalancer that kgateway provisions for a Gateway. Terraform
+# does not own those NLBs and cannot delete them; all it can do is delete the
+# Gateway (or the Argo CD Application that owns it) and let the chain run:
+#
+#   Gateway/Application deleted -> kgateway deletes the Service
+#     -> this controller sees the Service's service.k8s.aws/resources finalizer
+#     -> it deletes the NLB -> only then does the Service actually go away
+#
+# All of that is asynchronous. A `kubectl_manifest` delete returns as soon as
+# the CR is gone, so without this barrier Terraform tears down the controller
+# (and seconds later the cluster) while the NLBs are still being deleted. The
+# controller dies mid-flight, the NLB is orphaned, its ENIs keep holding the
+# private subnets, and the VPC destroy fails with DependencyViolation.
+#
+# On create this is a no-op (no create_duration). On destroy it holds the
+# controller -- and therefore the cluster -- alive for var.load_balancer_teardown_wait
+# after the last Gateway is deleted.
+################################################################################
+
+resource "time_sleep" "load_balancer_teardown" {
+  depends_on = [helm_release.aws_load_balancer_controller]
+
+  destroy_duration = var.load_balancer_teardown_wait
 }

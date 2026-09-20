@@ -30,7 +30,7 @@ resource "kubectl_manifest" "argocd_gateway_parameters" {
     }
   })
 
-  depends_on = [helm_release.argocd, kubectl_manifest.kgateway_helm]
+  depends_on = [helm_release.argocd, time_sleep.wait_for_kgateway_crds]
 }
 
 # The Gateway makes kgateway create a Service of type LoadBalancer carrying
@@ -79,9 +79,25 @@ resource "kubectl_manifest" "argocd_gateway" {
     }
   })
 
+  # Same mechanism as the Karpenter NodePool in 08-karpenter.tf: kgateway
+  # creates the LoadBalancer Service for this Gateway with an ownerReference
+  # back to it, and that Service carries the load balancer controller's
+  # service.k8s.aws/resources finalizer, which is only cleared once the NLB is
+  # actually deleted. Blocking on the Gateway's Foreground cascade therefore
+  # blocks until the NLB is gone, instead of returning while it is still being
+  # deleted.
+  #
+  # time_sleep.load_balancer_teardown stays as the backstop: it also covers the
+  # counter-api NLB, whose Gateway Terraform does not own at all.
+  wait           = true
+  delete_cascade = "Foreground"
+
+  # The barrier stands in for the controller here: same create order (the
+  # controller first), but on destroy it keeps the controller alive long enough
+  # to delete the NLB this Gateway's Service owns.
   depends_on = [
     kubectl_manifest.argocd_gateway_parameters,
-    helm_release.aws_load_balancer_controller,
+    time_sleep.load_balancer_teardown,
   ]
 }
 

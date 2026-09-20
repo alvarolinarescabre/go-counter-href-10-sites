@@ -3,6 +3,21 @@ kind: Application
 metadata:
   name: go-counter-href-10-sites
   namespace: argocd
+  # Without this, deleting the Application deletes ONLY the Application CR:
+  # the counter-api namespace, the Gateway and the LoadBalancer Service
+  # kgateway provisions for it all survive, so nothing ever asks the AWS Load
+  # Balancer Controller to delete the NLB. `terraform destroy` then leaves an
+  # orphaned NLB whose ENIs hold the private subnets, and the VPC destroy fails
+  # with DependencyViolation.
+  #
+  # With it, the delete cascades to every resource Argo CD manages and the
+  # Application is not removed until they are gone. That requires Argo CD to
+  # still be running -- see time_sleep.load_balancer_teardown in
+  # infra/aws/09-load-balancer-controller.tf for the ordering that guarantees
+  # it, and the Destroy section of infra/aws/README.md for the escape hatch if
+  # a delete ever wedges.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
   project: go-counter-href-10-sites-project
   source:

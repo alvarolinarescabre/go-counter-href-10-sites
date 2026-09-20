@@ -1,0 +1,234 @@
+name: Terraform AWS
+
+# Three levels of privilege, deliberately separated:
+#
+#   validate      no credentials at all       PRs (safe from forks)
+#   plan-on-main  the read-only `plan` user   automatic, on push to main
+#   dispatch      the read/write `apply` user manual only, gated by an Environment
+#
+# The two users come from infra/aws/bootstrap. Both jobs below read the SAME
+# secret names; the `aws-eks` Environment holds the apply user's keys and its
+# secrets win for the job bound to it, so the privilege split needs no logic
+# here -- see infra/aws/bootstrap/README.md.
+
+"on":
+  pull_request:
+    paths:
+      - "infra/aws/**"
+      - ".github/workflows/terraform-aws.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/aws/**"
+      - ".github/workflows/terraform-aws.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to run against the real AWS account"
+        required: true
+        type: choice
+        default: plan
+        options: [plan, apply, destroy]
+      confirm:
+        description: "For apply/destroy only: type the cluster name to confirm (chamo-dev-cluster)"
+        required: false
+        type: string
+
+# One Terraform run at a time: two concurrent runs would fight over the same
+# S3 state lock, and the loser fails halfway through.
+concurrency:
+  group: terraform-aws
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  TF_VERSION: "1.15.6"
+  # Confirmation phrase for the destructive dispatch actions. Matches
+  # "<project_name>-<environment>-cluster" in infra/aws/variables.tf.
+  CONFIRM_PHRASE: chamo-dev-cluster
+
+jobs:
+  ############################################################################
+  # Validate -- no AWS credentials, so this is safe on PRs from forks.
+  ############################################################################
+  validate:
+    name: Validate and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # The wrapper rewrites stdout and swallows exit codes, which breaks
+          # both the plan summary below and `terraform test`.
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive infra/aws
+
+      # -backend=false: initialising the real S3 backend would need credentials,
+      # and neither validate nor test ever touches the state.
+      - name: Validate (main stack)
+        working-directory: infra/aws
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: Validate (bootstrap)
+        working-directory: infra/aws/bootstrap
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      # Every provider in the suite is mocked, so these reach no AWS API, read
+      # and write no state, and need no credentials.
+      - name: Test (main stack)
+        working-directory: infra/aws
+        run: terraform test
+
+      - name: Test (bootstrap)
+        working-directory: infra/aws/bootstrap
+        run: terraform test
+
+  ############################################################################
+  # Plan on main -- read-only, automatic. Makes real drift against AWS visible
+  # right after a merge, with no clicks and nothing mutated.
+  ############################################################################
+  plan-on-main:
+    name: Plan (read-only)
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: infra/aws
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Repo-level secrets: the read-only `plan` user. It can still write the
+      # .tflock object, which native S3 locking needs even for a plan.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.TF_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.TF_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Init
+        run: terraform init -input=false
+
+      - name: Plan
+        id: plan
+        run: terraform plan -input=false -no-color -out=tfplan 2>&1 | tee plan.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Terraform plan (read-only, \`main\`)"
+            echo
+            echo '```terraform'
+            # The summary has a 1 MiB cap; a long plan is in the artifact.
+            tail -c 900000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: |
+            infra/aws/tfplan
+            infra/aws/plan.txt
+          retention-days: 14
+
+  ############################################################################
+  # Manual plan / apply / destroy against the real account.
+  #
+  # `environment: aws-eks` is what swaps in the apply user's credentials, and
+  # what lets you require a reviewer before the job starts (configure that on
+  # the Environment itself, in the repo settings).
+  ############################################################################
+  dispatch:
+    name: ${{ inputs.action }} (aws-eks)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: aws-eks
+    # Creating the cluster takes ~20 min; destroying it takes longer, and adds
+    # the load-balancer teardown barrier on top (var.load_balancer_teardown_wait).
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: infra/aws
+    steps:
+      # A wrong dropdown selection should not be one click away from deleting
+      # the cluster. The Environment's reviewers are the other half of this.
+      - name: Confirm destructive action
+        if: inputs.action != 'plan'
+        run: |
+          if [ "${{ inputs.confirm }}" != "${{ env.CONFIRM_PHRASE }}" ]; then
+            echo "::error::'${{ inputs.action }}' needs the confirm input set to '${{ env.CONFIRM_PHRASE }}'."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.TF_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.TF_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Init
+        run: terraform init -input=false
+
+      # The plan is always produced and always shown, whatever the action --
+      # including for destroy, where it is the last chance to see what goes.
+      - name: Plan
+        run: |
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+            terraform plan -input=false -no-color -destroy -out=tfplan 2>&1 | tee plan.txt
+          else
+            terraform plan -input=false -no-color -out=tfplan 2>&1 | tee plan.txt
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Terraform ${{ inputs.action }} plan"
+            echo
+            echo '```terraform'
+            tail -c 900000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-${{ inputs.action }}-${{ github.run_id }}
+          path: |
+            infra/aws/tfplan
+            infra/aws/plan.txt
+          retention-days: 30
+
+      # Applies the saved plan, not a fresh one: what was reviewed above is
+      # exactly what runs, with no re-resolution in between.
+      - name: Apply
+        if: inputs.action != 'plan'
+        run: terraform apply -input=false -no-color tfplan

@@ -53,7 +53,14 @@ resource "helm_release" "karpenter" {
     EOT
   ]
 
-  depends_on = [module.karpenter]
+  # Not just module.karpenter: this chart creates Services, and the AWS Load
+  # Balancer Controller registers a mutating webhook on every Service in the
+  # cluster. Installed in parallel, Karpenter's Service lands while that webhook
+  # exists but its backing pods do not, and the install dies with
+  # "no endpoints available for service aws-load-balancer-webhook-service".
+  # helm_release.aws_load_balancer_controller has wait = true, so depending on
+  # it means the controller is actually ready first.
+  depends_on = [module.karpenter, helm_release.aws_load_balancer_controller]
 }
 
 # Wait for Karpenter CRDs to be registered before creating EC2NodeClass and NodePool
@@ -162,6 +169,26 @@ resource "kubectl_manifest" "karpenter_node_pool" {
       }
     }
   })
+
+  # This is what makes `terraform destroy` actually terminate the EC2 instances
+  # Karpenter launched.
+  #
+  # Those instances belong to no Terraform resource and to no Auto Scaling
+  # group: Karpenter owns them through NodeClaims, which carry the
+  # karpenter.sh/termination finalizer and are owned by this NodePool. By
+  # default kubectl_manifest issues the DELETE and returns immediately, so
+  # Terraform would go on to remove the Karpenter controller and then the
+  # cluster while the drain was still running -- leaving the instances alive,
+  # their ENIs holding the private subnets, and the VPC destroy failing with
+  # DependencyViolation.
+  #
+  # `wait = true` makes the provider block until the object is really gone, and
+  # it waits for finalizers; it also switches delete_cascade to Foreground, so
+  # the NodePool is not removed until every NodeClaim it owns is. A NodeClaim is
+  # only removed once Karpenter has drained the node and terminated the
+  # instance. Deterministic, rather than a sleep and a hope.
+  wait           = true
+  delete_cascade = "Foreground"
 
   depends_on = [kubectl_manifest.karpenter_ec2_node_class, aws_iam_service_linked_role.spot]
 }

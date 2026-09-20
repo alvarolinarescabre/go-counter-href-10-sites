@@ -55,7 +55,9 @@ deploy/helm/counter-api/       Helm chart for the application
 deploy/argocd/                 Application, AppProject, and kgateway
 deploy/monitoring/dashboards/  Grafana dashboards shipped by Terraform
 infra/aws/                     Terraform for AWS/EKS (11-monitoring.tf: metrics)
+infra/aws/tests/               `terraform test` suite for the AWS stack
 infra/aws/bootstrap/           Initial IAM for GitHub Actions
+infra/aws/bootstrap/tests/     `terraform test` suite for the bootstrap root
 .github/workflows/deploy.yml   Build, push to ECR, and GitOps promotion
 ```
 
@@ -258,6 +260,20 @@ Especially review region, CIDRs, names, and certificate ARN. The plan includes
 VPC, subnets, NAT Gateway, EKS, node group, Karpenter, AWS Load Balancer
 Controller, Argo CD, Gateway API, kgateway, ECR, the EBS CSI driver and
 metrics-server addons, and the monitoring stack (VictoriaMetrics + Grafana).
+
+The stack also ships a test suite, which is worth running before a first apply
+and after any change to the Terraform:
+
+```bash
+terraform test                     # 63 tests, ~70s
+cd bootstrap && terraform test     # 16 tests, ~2s
+```
+
+It needs no AWS credentials and touches nothing — every provider is mocked, so
+a run never reaches an API, never reads or writes the S3 state, and never sees
+the cluster. Details, including what the tests can and cannot see, are in
+[`infra/aws/README.md`](infra/aws/README.md#tests) and
+[`infra/aws/bootstrap/README.md`](infra/aws/bootstrap/README.md#tests).
 
 ### 6. Create the infrastructure
 
@@ -640,10 +656,46 @@ terraform plan -destroy
 terraform destroy
 ```
 
-The remote Terraform bucket and its versions are not part of this stack and
-should be deleted separately only if you no longer need the state history.
-The VictoriaMetrics and Grafana EBS volumes use `reclaimPolicy: Delete` and are
-removed with the cluster, together with all stored metrics.
+It takes roughly three minutes longer than the plan suggests, deliberately.
+
+None of the three NLBs belong to Terraform: each is created by the AWS Load
+Balancer Controller from inside the cluster, in response to a `Service` that
+kgateway provisions for a `Gateway`. Terraform can only delete the `Gateway`
+(or the Argo CD `Application` that owns it) and let the controller do the rest,
+which is asynchronous. Two things keep that honest:
+
+- the Argo CD `Application`s carry `resources-finalizer.argocd.argoproj.io`, so
+  deleting one cascades to the namespace, Gateway, Service and PVCs it deployed
+  instead of leaving them behind; and
+- a teardown barrier (`var.load_balancer_teardown_wait`, default `180s`) holds
+  the controller — and therefore the cluster — alive after the last Gateway is
+  deleted, long enough for the NLBs to actually go.
+
+Without those, the NLBs are orphaned mid-deletion, their ENIs keep holding the
+private subnets, and the VPC destroy fails with `DependencyViolation`. The full
+explanation, the resulting order, and what to do if a destroy still leaves
+something behind or hangs on an `Application`, are in
+[`infra/aws/README.md`](infra/aws/README.md#destroy).
+
+Two things this does **not** remove:
+
+- **The remote Terraform bucket** and its versions are not part of this stack.
+  Delete it separately, and only if you no longer need the state history.
+- **Anything orphaned by an earlier destroy.** The cascade only applies to
+  Applications created with the finalizer, so run one `terraform apply` first if
+  the stack predates it. Leftover NLBs, EBS volumes and namespaces stuck in
+  `Terminating` have to be cleaned up by hand:
+
+  ```bash
+  aws elbv2 describe-load-balancers \
+    --query "LoadBalancers[?VpcId=='<vpc-id>'].[LoadBalancerName,DNSName]" --output table
+  aws ec2 describe-volumes --filters Name=status,Values=available \
+    --query 'Volumes[].[VolumeId,Size,CreateTime]' --output table
+  ```
+
+When the cascade does run, the VictoriaMetrics and Grafana volumes go with it —
+their PVCs use `reclaimPolicy: Delete`, so the EBS CSI driver deletes them,
+along with all stored metrics.
 
 ## Troubleshooting
 

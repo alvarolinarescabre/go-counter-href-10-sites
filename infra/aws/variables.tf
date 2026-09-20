@@ -198,6 +198,23 @@ variable "argocd_gateway_annotations" {
 }
 
 
+variable "kgateway_sync_wait" {
+  description = <<-EOT
+    How long to wait after applying the kgateway Argo CD Applications before
+    Terraform creates the first GatewayParameters.
+
+    04-ingress-controller.tf only creates `Application` objects; Argo CD then
+    has to pull the kgateway-crds and kgateway charts and sync them before
+    gateway.kgateway.dev/v1alpha1 exists as an API. Applying a GatewayParameters
+    any earlier fails with "isn't valid for cluster".
+
+    This is a heuristic, not a check -- raise it if an apply on a cold cluster
+    still fails that way.
+  EOT
+  type        = string
+  default     = "120s"
+}
+
 variable "ecr_repository_name" {
   description = "Name of the ECR repository holding the go-counter-href-10-sites image. Must match the repository part of image.repository in the Helm values and of ECR_REPOSITORY in the deploy workflow."
   type        = string
@@ -349,6 +366,24 @@ variable "load_balancer_controller_namespace" {
   description = "Namespace the AWS Load Balancer Controller runs in."
   type        = string
   default     = "kube-system"
+}
+
+variable "load_balancer_teardown_wait" {
+  description = <<-EOT
+    How long `terraform destroy` holds the AWS Load Balancer Controller (and so
+    the cluster) alive after the last Gateway is deleted, so the controller can
+    finish deleting the NLBs it created.
+
+    Nothing in Terraform owns those NLBs, and deleting a Gateway returns long
+    before the NLB behind it is gone -- see time_sleep.load_balancer_teardown in
+    09-load-balancer-controller.tf. An NLB delete usually takes 30-60s; the
+    default leaves margin for three of them (counter-api, Argo CD, Grafana).
+
+    It costs nothing on apply. Raise it if a destroy still leaves load balancers
+    behind; lower it only if you are certain no Gateway is left.
+  EOT
+  type        = string
+  default     = "180s"
 }
 
 variable "load_balancer_controller_service_account" {

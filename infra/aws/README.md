@@ -83,7 +83,7 @@ manifests and then hands off control to Argo CD's own sync loop.
 │           ├── crds-helm.yaml         # ArgoCD Application installing the kgateway-crds Helm chart
 │           ├── helm.yaml              # ArgoCD Application installing the kgateway controller Helm chart
 │           └── parameters.yaml        # GatewayParameters: public-facing AWS NLB configuration
-└── infra/eks/                         # (this directory)
+└── infra/aws/                         # (this directory)
     ├── providers.tf                   # Terraform/provider requirements (aws, kubernetes, kubectl, helm)
     ├── variables.tf                   # Input variables (region, naming, CIDRs, ArgoCD chart, ...)
     ├── locals.tf                      # Derived naming, CIDRs, AZs, and caller's public IP
@@ -99,8 +99,11 @@ manifests and then hands off control to Argo CD's own sync loop.
     ├── 08-karpenter.tf                # Karpenter IAM/SQS, controller, EC2NodeClass + NodePool
     ├── 09-load-balancer-controller.tf # AWS Load Balancer Controller (IAM via Pod Identity + Helm)
     ├── 10-cluster-access.tf           # Human access: Identity Center permission sets + break-glass role
+    ├── 11-monitoring.tf               # EBS CSI + gp3 StorageClass, VictoriaMetrics/Grafana, Grafana Gateway
     ├── policies/                      # Vendored upstream IAM policy documents
+    ├── tests/                         # `terraform test` suite for this root (see Tests below)
     └── bootstrap/                     # Separate root: the two CI IAM users and their policies
+        └── tests/                     # `terraform test` suite for the bootstrap root
 ```
 
 ## Resources deployed
@@ -354,7 +357,7 @@ DynamoDB table involved). The bucket/key/region are literal values in
 init` time — see the comment on that block for why (a config that depends on a variable
 being set correctly at init time silently falls back to local state if that variable is
 ever missing, which caused a real incident once). If you need a different bucket/region,
-edit that block directly; see [Remote state bootstrap](#remote-state-bootstrap) below to
+edit that block directly; see [Remote state bootstrap](#1-remote-state-bootstrap) below to
 create it.
 
 ```bash
@@ -418,6 +421,213 @@ kubectl get httproutes.gateway.networking.k8s.io -n counter-api
 terraform destroy
 ```
 
+It takes about three minutes longer than you would expect, on purpose.
+
+**Why it needs care.** Two whole classes of AWS resource in this stack are
+created from *inside* the cluster and belong to no Terraform resource at all.
+Delete the EKS cluster without removing them first and they are simply orphaned
+— still running, still billed, and still holding the ENIs that make the VPC
+destroy fail with `DependencyViolation`.
+
+### Karpenter's EC2 instances
+
+Karpenter launches instances directly; they are in no Auto Scaling group and no
+node group. The only thing that terminates them is Karpenter itself, draining
+the `NodeClaim`s that own them. That is wired up deterministically, with no
+guessing:
+
+- `kubectl_manifest.karpenter_node_pool` sets `wait = true` and
+  `delete_cascade = "Foreground"`. The provider then blocks until the NodePool
+  object is really gone, and the Foreground cascade means it is not gone until
+  every `NodeClaim` it owns is. A NodeClaim carries the
+  `karpenter.sh/termination` finalizer, which Karpenter clears only after it has
+  drained the node and terminated the instance. So the delete returns exactly
+  when the last instance is gone.
+- Both Argo CD `Application`s are ordered **ahead** of the NodePool. The
+  counter-api chart ships a PodDisruptionBudget (`maxUnavailable: 25%`) and so
+  does the gateway proxy (`minAvailable: 1`); a PDB cannot block the eviction of
+  a pod that no longer exists, so the workloads go first and the drain has
+  nothing to fight. The same edge gives the right order on the way up: the
+  NodePool exists before the application is handed to Argo CD.
+
+The resulting order is `workloads → NodePool (drains, terminates) → Karpenter
+controller → cluster`.
+
+### The load balancers
+
+None of the three NLBs in this stack belong to Terraform.
+Each one is created by the AWS Load Balancer Controller, from inside the
+cluster, in response to a `Service` of type `LoadBalancer` that kgateway
+provisions for a `Gateway`:
+
+| NLB | Gateway | Owned by |
+| --- | --- | --- |
+| counter-api | `public-nlb-gateway` (ns `counter-api`) | Argo CD, via the Helm chart |
+| Argo CD UI | `argocd-gateway` (ns `argocd`) | Terraform (`06-argocd-ingress.tf`) |
+| Grafana | `grafana-gateway` (ns `monitoring`) | Terraform (`11-monitoring.tf`) |
+
+All Terraform can do is delete the `Gateway` (or the Argo CD `Application` that
+owns it) and let the rest of the chain run:
+
+```text
+Gateway/Application deleted
+  -> kgateway deletes the Service
+  -> the load balancer controller sees the Service's
+     service.k8s.aws/resources finalizer
+  -> it deletes the NLB
+  -> only then does the Service actually go away
+```
+
+Every step there is asynchronous, so three things are wired in to keep the
+destroy honest:
+
+- The two Gateways Terraform *does* own use the same trick as the NodePool
+  above (`wait = true`, `delete_cascade = "Foreground"`). kgateway creates each
+  Gateway's Service with an ownerReference back to it, and that Service carries
+  the controller's `service.k8s.aws/resources` finalizer — cleared only once the
+  NLB is really deleted. So those two deletes block until their NLB is gone.
+
+- The Argo CD `Application`s carry `resources-finalizer.argocd.argoproj.io`
+  ([`deploy/argocd/application.yaml`](../../deploy/argocd/application.yaml) and
+  the `victoria-metrics-k8s-stack` Application in `11-monitoring.tf`). Without
+  it, deleting an Application removes only the Application object: the
+  namespace, the Gateway, the Service and the NLB all survive, and so do
+  Grafana's and VMSingle's gp3 volumes.
+- `time_sleep.load_balancer_teardown` (`09-load-balancer-controller.tf`) sits
+  between those deletions and the controller, so the controller — and therefore
+  the cluster — stays up for `var.load_balancer_teardown_wait` (default `180s`)
+  after the last Gateway is deleted. Without it Terraform removes the controller
+  seconds later and the NLBs are orphaned mid-deletion.
+
+The resulting order is:
+
+```text
+Applications (cascade: pods, Gateways, Services, PVCs)
+  -> Karpenter NodePool   (blocks until every instance is terminated)
+  -> Gateways Terraform owns (block until their NLB is gone)
+  -> 180s barrier         (backstop for the counter-api NLB, which Terraform
+                           does not own, and for anything still in flight)
+  -> Karpenter controller + load balancer controller
+  -> Argo CD -> EKS -> VPC
+```
+
+Nothing about this affects `apply`: the barrier has no `create_duration`.
+
+**Before the first clean destroy**, run one `terraform apply`. The finalizer
+lives in a manifest, so an Application created before this change does not have
+it and will not cascade.
+
+**If a destroy still leaves load balancers behind**, raise
+`var.load_balancer_teardown_wait` and re-run — Terraform is idempotent here.
+Check what is left with:
+
+```bash
+aws elbv2 describe-load-balancers \
+  --query "LoadBalancers[?VpcId=='<vpc-id>'].[LoadBalancerName,DNSName]" --output table
+aws ec2 describe-instances --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
+  "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].[InstanceId,InstanceType]' --output table
+```
+
+**If a destroy hangs on the NodePool**, a node is failing to drain — almost
+always a pod its PodDisruptionBudget will not let go of. Look first, then
+release it:
+
+```bash
+kubectl get nodeclaims
+kubectl get pdb -A
+kubectl delete nodeclaims --all          # Karpenter still terminates the instances
+```
+
+If Karpenter itself is already gone, its finalizers have nobody to clear them;
+strip them and terminate the instances yourself:
+
+```bash
+kubectl patch nodeclaim <name> --type=merge -p '{"metadata":{"finalizers":null}}'
+aws ec2 describe-instances --filters "Name=tag:karpenter.sh/nodepool,Values=default" \
+  "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].InstanceId' --output text
+```
+
+**If a destroy hangs on an Application**, the cascade is waiting for something
+it cannot delete (usually because Argo CD or the controller is already gone).
+Drop the finalizer by hand and re-run:
+
+```bash
+kubectl -n argocd patch application <name> \
+  --type=merge -p '{"metadata":{"finalizers":null}}'
+```
+
+That leaves the NLB orphaned, so delete it yourself afterwards
+(`aws elbv2 delete-load-balancer --load-balancer-arn ...`) before the VPC
+destroy, which would otherwise fail with `DependencyViolation` on the private
+subnets.
+
+## Tests
+
+```bash
+cd infra/aws
+terraform test
+```
+
+63 tests across six files in [`tests/`](tests). **They need no AWS credentials
+and touch nothing** — every provider is replaced by a `mock_provider`, so a run
+never reaches an API, never reads or writes the S3 state, and never sees the
+real cluster. A full run takes about 70 seconds.
+
+| File | What it pins |
+|---|---|
+| `network_and_cluster.tftest.hcl` | Naming and the `<project>-<env>-*` prefix the CI apply user's IAM is scoped to; VPC CIDRs, AZ count, single NAT; the subnet tags Karpenter and the load balancer controller discover by; the addon set that replaces Auto Mode; the controller's Pod Identity wiring |
+| `cluster_access.tftest.hcl` | Identity Center permission sets → EKS access entries (policy mapping, namespace scoping, path stripping); the break-glass role and its assume policy; `additional_cluster_admin_arns`; every variable validation |
+| `argocd_ingress.tftest.hcl` | The Gateway create-vs-reuse logic, TLS termination at the NLB, listener and `parentRef` wiring, host matching, and the off switches |
+| `karpenter_and_ecr.tftest.hcl` | NodePool requirements and the CPU ceiling, EC2NodeClass discovery tags, the spot service-linked role, ECR immutability and the lifecycle rules |
+| `monitoring.tftest.hcl` | The gp3 StorageClass, VMSingle/Grafana storage, the components deliberately left off, and the Argo CD sync options the chart's quirks need |
+| `lifecycle.tftest.hcl` | The orderings that only fail against a real cluster: on the way up, the wait for Argo CD to sync kgateway's CRDs and the disabled Service mutator webhook; on the way down, the cascade finalizers and the teardown barrier described under [Destroy](#destroy) |
+
+Useful flags:
+
+```bash
+terraform test -filter=tests/argocd_ingress.tftest.hcl   # one file
+terraform test -verbose                                  # show the plan behind a failure
+terraform test -json                                     # machine-readable, for CI
+```
+
+In CI, `terraform init -backend=false` is enough — the tests never use the
+backend:
+
+```bash
+cd infra/aws && terraform init -backend=false && terraform test
+```
+
+### Reading a failure
+
+A failing `run` marks every later `run` **in the same file** as `skip`, because
+Terraform aborts a test file at the first failure. `1 failed, 12 skipped` means
+one real failure, not thirteen. Other files still run.
+
+### What the tests can and cannot see
+
+Worth knowing before adding to them:
+
+- **Assertions reach a module's outputs, never its internal resources.**
+  `module.eks.cluster_version` works; `module.eks.aws_eks_cluster.this[0]` does
+  not. So the managed node group's launch template and the `compute_config`
+  block are not asserted — they are not observable from a test. The addon set
+  is, through `module.eks.cluster_addons`.
+- **Values that come out of a provider are fake**, including
+  `data.aws_iam_policy_document.*.json`. Assume-role policies are therefore not
+  assertable in this root. The policies that *are* asserted — the ECR lifecycle
+  rules, the break-glass assume policy — are built with `jsonencode()` in the
+  configuration itself. (The bootstrap root does not have this limitation; see
+  [`bootstrap/README.md`](bootstrap/README.md#tests).)
+- **`terraform test` loads `terraform.tfvars`.** A `run` block with no
+  `variables` of its own is therefore testing the configuration *as actually
+  deployed*, not the variable defaults.
+- **Most runs use `command = apply`**, not `plan`, because the interesting
+  values (rendered Helm values, manifest bodies that interpolate a cluster name)
+  are only known once resources exist. With every provider mocked, an apply
+  calls nothing.
+
 ## Continuous deployment
 
 [`.github/workflows/terraform-aws.yml`](../../.github/workflows/terraform-aws.yml) runs
@@ -474,15 +684,19 @@ runs once, by a human with administrator credentials, and keeps local state.
 If the users already exist from the old manual setup, import them first; see
 [bootstrap/README.md](bootstrap/README.md).
 
-The workflow reads `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from GitHub secrets. GitHub
-resolves **environment** secrets before repo-level ones for any job bound to that
-environment, so defining the same secret names at both levels gives the two jobs
-different privilege without any extra workflow logic:
+The workflow reads `TF_AWS_ACCESS_KEY_ID`/`TF_AWS_SECRET_ACCESS_KEY` from GitHub secrets.
+The `TF_` prefix keeps them separate from the plain `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+that [`deploy.yml`](../../.github/workflows/deploy.yml) uses to push images to ECR — that
+credential needs write access to ECR, so it cannot be the read-only plan user.
+
+GitHub resolves **environment** secrets before repo-level ones for any job bound to that
+environment, so defining the same two names at both levels gives the two jobs different
+privilege without any extra workflow logic:
 
 | Secret scope | Used by | IAM user | Policies |
 |---|---|---|---|
 | Repo-level (Settings → Secrets and variables → Actions) | `plan-on-main` (automatic, every push) | `gha-counter-api-terraform-plan` | `ReadOnlyAccess` + `<project>-<env>-terraform-shared` |
-| Environment-level, on `aws-eks` (Settings → Environments → aws-eks → secrets) | `terraform` (manual, reviewer-gated) | `gha-counter-api-terraform-apply` | the above + `<project>-<env>-terraform-apply` |
+| Environment-level, on `aws-eks` (Settings → Environments → aws-eks → secrets) | `dispatch` (manual `plan`/`apply`/`destroy`) | `gha-counter-api-terraform-apply` | the above + `<project>-<env>-terraform-apply` |
 
 Two details in there are easy to get wrong, and both are handled in the shared
 policy rather than left to whoever sets this up:
@@ -506,10 +720,15 @@ aws iam create-access-key --user-name gha-counter-api-terraform-plan
 aws iam create-access-key --user-name gha-counter-api-terraform-apply
 ```
 
-If you'd rather not maintain two IAM users, define `AWS_ACCESS_KEY_ID`/
-`AWS_SECRET_ACCESS_KEY` only at the repo level with the apply user's key — simpler, at
+If you'd rather not maintain two IAM users, define `TF_AWS_ACCESS_KEY_ID`/
+`TF_AWS_SECRET_ACCESS_KEY` only at the repo level with the apply user's key — simpler, at
 the cost of the automatic `plan-on-main` job also holding write-capable credentials on
 every push to `main`.
+
+Reviewer approval is not in the workflow file: add it on the Environment itself
+(Settings → Environments → `aws-eks` → **Required reviewers**). `apply` and `destroy`
+additionally require typing the cluster name into the `confirm` input, so a mis-clicked
+dropdown cannot delete the cluster on its own.
 
 The apply policy is scoped by name for IAM (`<project>-<env>-*`, plus a
 conditioned `CreateServiceLinkedRole` and the cluster's OIDC provider) and
@@ -581,6 +800,8 @@ already exists.
 | `load_balancer_controller_chart_version` | aws-load-balancer-controller chart version | `3.5.0` |
 | `load_balancer_controller_namespace` | Namespace it runs in       | `kube-system`       |
 | `load_balancer_controller_service_account` | Its service account (bound to the Pod Identity association) | `aws-load-balancer-controller` |
+| `load_balancer_teardown_wait` | How long `destroy` keeps the controller alive after the last Gateway is deleted, so it can finish deleting the NLBs ([Destroy](#destroy)) | `180s` |
+| `kgateway_sync_wait` | How long to wait for Argo CD to sync the kgateway charts before creating the first `GatewayParameters` | `120s` |
 | `enable_monitoring` | Install VictoriaMetrics + Grafana via Argo CD | `true` |
 | `monitoring_namespace` | Namespace for the monitoring stack | `monitoring` |
 | `victoria_metrics_k8s_stack_chart_version` | victoria-metrics-k8s-stack chart version | `0.92.1` |

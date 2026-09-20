@@ -53,7 +53,7 @@ provider "aws" {
 
 provider "aws" {
   alias  = "virginia"
-  region = "us-east-1"   # N. Virginia – ECR Public
+  region = "us-east-1" # N. Virginia – ECR Public
 }
 
 provider "kubernetes" {

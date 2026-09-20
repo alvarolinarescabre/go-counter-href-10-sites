@@ -64,12 +64,59 @@ CI secrets on whoever's laptop ran the apply.
   then treat `terraform.tfstate` as a credential — or `terraform state rm
   'aws_iam_access_key.ci["plan"]'` (and `["apply"]`) once GitHub has them.
 
+## Tests
+
+```bash
+cd infra/aws/bootstrap
+terraform test
+```
+
+16 tests in [`tests/`](tests), split in two: `ci_users.tftest.hcl` covers the
+users, their attachments and the access keys; `iam_policies.tftest.hcl` covers
+the two policy documents. A run takes about two seconds and **needs no AWS
+credentials**.
+
+The provider is real but configured offline — dummy keys and every validation,
+metadata and region check switched off — with only the two data sources that do
+call AWS (`aws_caller_identity`, `aws_partition`) replaced by `override_data`.
+That matters: `aws_iam_policy_document` is rendered locally by the provider, so
+the tests assert against the **real** JSON rather than a mock, and every `run`
+uses `command = plan`, so nothing is ever created.
+
+What they pin down is the part of this root that is easy to widen by accident:
+
+- The privilege split — the `plan` user never gets the write policy, whatever
+  the users are renamed to.
+- The scoping of `iam:*Role*`/`iam:*Policy*` to `<project>-<env>-*`, and that
+  it is never granted on `*`.
+- Both `Deny` statements: self-escalation (users, access keys, login profiles,
+  groups) and any in-place edit of this root's own two policies.
+- That `CreateServiceLinkedRole` on `*` keeps its `iam:AWSServiceName`
+  condition, and that `spot.amazonaws.com` stays in the list — without it
+  Karpenter cannot launch spot capacity.
+- That the state grant includes `s3:PutObject`/`s3:DeleteObject`, since
+  `use_lockfile = true` makes even a plan write the `.tflock` object.
+- That nothing hardcodes the `aws` partition.
+- The prefix contract with `../`: changing `project_name`/`environment` has to
+  move the policy names *and* the IAM scoping together, or the apply user
+  silently loses access to the resources it is meant to manage.
+
+The main stack has its own, larger suite — see
+[`../README.md`](../README.md#tests).
+
 ## What each user gets
 
 | User | Policies | Used by |
 |---|---|---|
-| `…-terraform-plan` | `ReadOnlyAccess`, `<project>-<env>-terraform-shared` | The automatic `plan-on-main` job (repo-level GitHub secrets) |
-| `…-terraform-apply` | `ReadOnlyAccess`, `…-terraform-shared`, `…-terraform-apply` | The manual, reviewer-gated apply/destroy job (`aws-eks` environment secrets) |
+| `…-terraform-plan` | `ReadOnlyAccess`, `<project>-<env>-terraform-shared` | The automatic `plan-on-main` job (repo-level secrets) |
+| `…-terraform-apply` | `ReadOnlyAccess`, `…-terraform-shared`, `…-terraform-apply` | The manual `dispatch` job (`aws-eks` environment secrets) |
+
+Both are read from the secrets `TF_AWS_ACCESS_KEY_ID` / `TF_AWS_SECRET_ACCESS_KEY` in
+[`.github/workflows/terraform-aws.yml`](../../../.github/workflows/terraform-aws.yml).
+The same two names at both levels is the whole mechanism: GitHub resolves an
+environment's secrets first for a job bound to it, so the privilege split needs
+no logic in the workflow. The `TF_` prefix keeps them clear of the plain
+`AWS_*` secrets that `deploy.yml` uses to push to ECR.
 
 **`…-terraform-shared`** — S3 state access and `iam:ListRoles`. Two things in it
 are easy to get wrong:

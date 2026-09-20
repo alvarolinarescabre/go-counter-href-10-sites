@@ -87,7 +87,11 @@ resource "kubectl_manifest" "monitoring_namespace" {
     }
   })
 
-  depends_on = [module.eks]
+  # Deleting the namespace blocks on the finalizers of everything still in it --
+  # Grafana's LoadBalancer Service among them. The barrier is what keeps the
+  # load balancer controller alive to clear those, instead of leaving the
+  # namespace stuck Terminating and the NLB orphaned.
+  depends_on = [module.eks, time_sleep.load_balancer_teardown]
 }
 
 resource "kubectl_manifest" "victoria_metrics_k8s_stack" {
@@ -99,6 +103,12 @@ resource "kubectl_manifest" "victoria_metrics_k8s_stack" {
     metadata = {
       name      = "victoria-metrics-k8s-stack"
       namespace = var.argocd_namespace
+      # Deleting an Application without this removes only the Application CR.
+      # The monitoring namespace, the VMSingle and Grafana PVCs and the gp3 EBS
+      # volumes behind them all survive `terraform destroy` -- the cluster goes
+      # away and the volumes are billed forever. With it, the delete cascades
+      # and the Application is not removed until its resources are gone.
+      finalizers = ["resources-finalizer.argocd.argoproj.io"]
     }
     spec = {
       project = "default"
@@ -138,10 +148,19 @@ resource "kubectl_manifest" "victoria_metrics_k8s_stack" {
     }
   })
 
+  # The teardown barrier is in here too: the cascade above has to delete
+  # Grafana's PVCs, and the EBS CSI driver behind them only works while the
+  # cluster is still up.
+  # karpenter_node_pool for the same reason as in 05-app-deployment.tf: these
+  # pods (VMSingle, Grafana, node-exporter, kube-state-metrics) sit on
+  # Karpenter-provisioned nodes, and they have to be gone before the NodePool is
+  # drained rather than during it.
   depends_on = [
     kubectl_manifest.monitoring_namespace,
     kubectl_manifest.gp3_storage_class,
+    kubectl_manifest.karpenter_node_pool,
     time_sleep.wait_for_argocd_crds,
+    time_sleep.load_balancer_teardown,
   ]
 }
 
@@ -171,7 +190,7 @@ resource "kubectl_manifest" "grafana_gateway_parameters" {
     }
   })
 
-  depends_on = [kubectl_manifest.monitoring_namespace, kubectl_manifest.kgateway_helm]
+  depends_on = [kubectl_manifest.monitoring_namespace, time_sleep.wait_for_kgateway_crds]
 }
 
 resource "kubectl_manifest" "grafana_gateway" {
@@ -204,9 +223,25 @@ resource "kubectl_manifest" "grafana_gateway" {
     }
   })
 
+  # Same mechanism as the Karpenter NodePool in 08-karpenter.tf: kgateway
+  # creates the LoadBalancer Service for this Gateway with an ownerReference
+  # back to it, and that Service carries the load balancer controller's
+  # service.k8s.aws/resources finalizer, which is only cleared once the NLB is
+  # actually deleted. Blocking on the Gateway's Foreground cascade therefore
+  # blocks until the NLB is gone, instead of returning while it is still being
+  # deleted.
+  #
+  # time_sleep.load_balancer_teardown stays as the backstop: it also covers the
+  # counter-api NLB, whose Gateway Terraform does not own at all.
+  wait           = true
+  delete_cascade = "Foreground"
+
+  # See time_sleep.load_balancer_teardown in 09-load-balancer-controller.tf:
+  # the barrier replaces the direct dependency so that on destroy the
+  # controller outlives this Gateway and can delete its NLB.
   depends_on = [
     kubectl_manifest.grafana_gateway_parameters,
-    helm_release.aws_load_balancer_controller,
+    time_sleep.load_balancer_teardown,
   ]
 }
 

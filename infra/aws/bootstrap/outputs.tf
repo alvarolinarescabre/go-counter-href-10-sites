@@ -40,11 +40,13 @@ Two IAM users for the Terraform workflow in ../, with the permissions the main s
 
   ${aws_iam_user.ci["plan"].name}
     ReadOnlyAccess + ${aws_iam_policy.terraform_shared.name}
-    -> repo-level GitHub secrets, used by the automatic plan-on-main job
+    -> repo-level secrets TF_AWS_ACCESS_KEY_ID / TF_AWS_SECRET_ACCESS_KEY,
+       used by the automatic plan-on-main job
 
   ${aws_iam_user.ci["apply"].name}
     ReadOnlyAccess + ${aws_iam_policy.terraform_shared.name} + ${aws_iam_policy.terraform_apply.name}
-    -> `aws-eks` environment secrets, used by the manual apply/destroy job
+    -> the SAME two names as `aws-eks` environment secrets, used by the
+       manual dispatch (plan/apply/destroy) job
 
 
 Access keys:
@@ -54,7 +56,7 @@ ${var.create_access_keys ? "Created. Read them with 'terraform output -json ci_a
 
 Next:
 -----
-1) Put the keys in GitHub: the plan user's at repo level, the apply user's on the 'aws-eks' environment. Environment secrets win for jobs bound to that environment, which is what gives the two jobs different privilege with no extra workflow logic.
+1) Put the keys in GitHub as TF_AWS_ACCESS_KEY_ID / TF_AWS_SECRET_ACCESS_KEY: the plan user's at repo level, the apply user's on the 'aws-eks' environment. Environment secrets win for jobs bound to that environment, which is what gives the two jobs different privilege with no extra workflow logic. The TF_ prefix keeps them clear of the plain AWS_* secrets deploy.yml uses to push to ECR.
 2) Assign the IAM Identity Center permission sets named in ../variables.tf (var.sso_access_permission_sets) to this account, if you have not already -- the main stack's plan fails on a permission set that has no role here.
 3) Run the main stack: cd .. && terraform init && terraform plan
 EOT
