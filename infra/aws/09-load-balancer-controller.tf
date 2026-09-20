@@ -104,7 +104,17 @@ resource "helm_release" "aws_load_balancer_controller" {
     enableServiceMutatorWebhook = false
   })]
 
+  # module.eks, not just the cluster: this chart's pods need somewhere to RUN,
+  # and the managed node group is the only compute that is not itself managed
+  # from inside the cluster. Referencing module.eks.cluster_name (as the values
+  # above do) builds an edge to the cluster and to nothing else, so on destroy
+  # Terraform is free to delete the node group *in parallel* with this release.
+  # That is what deadlocked the teardown on 2026-09-20: the system nodes went
+  # away mid-drain, every controller went Pending, and the NodeClaim finalizers
+  # that only Karpenter can clear were left with no Karpenter to clear them.
+  # A depends_on over the whole module covers its node group too.
   depends_on = [
+    module.eks,
     aws_eks_pod_identity_association.aws_load_balancer_controller,
     aws_iam_role_policy_attachment.aws_load_balancer_controller,
   ]

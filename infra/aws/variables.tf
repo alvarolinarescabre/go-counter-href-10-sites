@@ -374,10 +374,13 @@ variable "load_balancer_teardown_wait" {
     the cluster) alive after the last Gateway is deleted, so the controller can
     finish deleting the NLBs it created.
 
-    Nothing in Terraform owns those NLBs, and deleting a Gateway returns long
-    before the NLB behind it is gone -- see time_sleep.load_balancer_teardown in
-    09-load-balancer-controller.tf. An NLB delete usually takes 30-60s; the
-    default leaves margin for three of them (counter-api, Argo CD, Grafana).
+    Nothing in Terraform owns those NLBs. Each of the three deletes now blocks
+    on its own: the Argo CD and Grafana Gateways through `wait` +
+    `delete_cascade = "Foreground"`, and counter-api's through the Argo CD
+    finalizer on kubectl_manifest.argocd_application. This barrier is the
+    margin around them, not the mechanism -- see
+    time_sleep.load_balancer_teardown in 09-load-balancer-controller.tf. An NLB
+    delete usually takes 30-60s.
 
     It costs nothing on apply. Raise it if a destroy still leaves load balancers
     behind; lower it only if you are certain no Gateway is left.

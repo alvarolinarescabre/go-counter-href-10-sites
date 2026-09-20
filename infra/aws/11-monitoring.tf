@@ -231,8 +231,11 @@ resource "kubectl_manifest" "grafana_gateway" {
   # blocks until the NLB is gone, instead of returning while it is still being
   # deleted.
   #
-  # time_sleep.load_balancer_teardown stays as the backstop: it also covers the
-  # counter-api NLB, whose Gateway Terraform does not own at all.
+  # time_sleep.load_balancer_teardown stays as a backstop. All three NLBs now
+  # block their own delete -- the two Gateways Terraform owns through this
+  # cascade, and counter-api's through the Argo CD finalizer on
+  # kubectl_manifest.argocd_application -- so the timer is margin, not the
+  # mechanism.
   wait           = true
   delete_cascade = "Foreground"
 

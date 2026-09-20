@@ -478,6 +478,41 @@ guessing:
 The resulting order is `workloads → NodePool (drains, terminates) → Karpenter
 controller → cluster`.
 
+### The compute has to outlive the controllers
+
+Karpenter, the load balancer controller and Argo CD are all *pods*. Each one
+has to still be running to clean up what it owns — the NodeClaims, the NLBs,
+the Application cascade. So the managed node group they run on has to be one of
+the last things to go.
+
+Nothing expressed that. Every one of them references `module.eks.cluster_name`
+or `module.eks.cluster_endpoint`, which builds an edge to the cluster and to
+**nothing else**; the node group is a separate resource inside the module with
+no edge to any of them. On destroy Terraform was therefore free to delete the
+node group *in parallel* with them.
+
+On 2026-09-20 it did exactly that, and the teardown deadlocked:
+
+```text
+14:12  NodePool deleted -> Karpenter taints its 3 nodes karpenter.sh/disrupted
+       and starts draining; the NodeClaims get karpenter.sh/termination
+ ~same  the managed node group is deleted in parallel -- the system nodes go
+       away, and with them the Karpenter and load balancer controller pods
+  then  those pods cannot reschedule: the only nodes left carry the taint
+       their Deployment deliberately does not tolerate
+```
+
+Only Karpenter can clear `karpenter.sh/termination`, and Karpenter had nowhere
+to run. The `wait = true` on the NodePool then blocked forever on a finalizer
+nobody was left to remove, the three NLBs were never deleted, and the three
+instances had to be terminated by hand.
+
+The fix is a `depends_on = [module.eks]` on the three `helm_release`s — the
+whole module, not one of its outputs, which is what pulls the node group in.
+Everything else (the NodePool, the Applications) inherits it transitively.
+Verify with the `terraform graph` recipe under
+[What the tests can and cannot see](#what-the-tests-can-and-cannot-see).
+
 ### The load balancers
 
 None of the three NLBs in this stack belong to Terraform.
@@ -518,22 +553,43 @@ destroy honest:
   it, deleting an Application removes only the Application object: the
   namespace, the Gateway, the Service and the NLB all survive, and so do
   Grafana's and VMSingle's gp3 volumes.
+
+- **counter-api's NLB is the one Terraform owns least**, and it is handled
+  through that finalizer. Terraform owns neither its Gateway nor its Service —
+  the chart creates both — so the only thing it can block on is the
+  `Application` itself. `kubectl_manifest.argocd_application` sets `wait = true`
+  (`delete_cascade = "Foreground"`), and the provider's `wait` blocks on
+  finalizers: Argo CD clears `resources-finalizer` only after it has pruned
+  every resource the chart deployed, Gateway included. So the delete returns
+  when the NLB is really gone.
+
+  Before this, that delete returned as soon as the API server accepted it,
+  while the cascade was still running — leaving only the timer below between a
+  slow NLB delete and an orphaned load balancer. If the cascade ever wedges and
+  the destroy hangs there, `kubectl patch application counter-api -n argocd
+  --type=merge -p '{"metadata":{"finalizers":null}}'` releases it, at the cost
+  of orphaning whatever had not been pruned.
+
 - `time_sleep.load_balancer_teardown` (`09-load-balancer-controller.tf`) sits
   between those deletions and the controller, so the controller — and therefore
   the cluster — stays up for `var.load_balancer_teardown_wait` (default `180s`)
-  after the last Gateway is deleted. Without it Terraform removes the controller
-  seconds later and the NLBs are orphaned mid-deletion.
+  after the last Gateway is deleted. With all three NLBs now blocking their own
+  delete this is margin rather than mechanism, but it still covers anything
+  still in flight — Terraform would otherwise remove the controller seconds
+  later.
 
 The resulting order is:
 
 ```text
 Applications (cascade: pods, Gateways, Services, PVCs)
   -> Karpenter NodePool   (blocks until every instance is terminated)
+  -> Applications         (block on the Argo CD finalizer: the counter-api
+                           Gateway, its Service and its NLB are gone first)
   -> Gateways Terraform owns (block until their NLB is gone)
-  -> 180s barrier         (backstop for the counter-api NLB, which Terraform
-                           does not own, and for anything still in flight)
+  -> 180s barrier         (margin for anything still in flight)
   -> Karpenter controller + load balancer controller
-  -> Argo CD -> EKS -> VPC
+  -> Argo CD
+  -> EKS (cluster AND its managed node group) -> VPC
 ```
 
 Nothing about this affects `apply`: the barrier has no `create_duration`.
@@ -646,6 +702,22 @@ Worth knowing before adding to them:
   rules, the break-glass assume policy — are built with `jsonencode()` in the
   configuration itself. (The bootstrap root does not have this limitation; see
   [`bootstrap/README.md`](bootstrap/README.md#tests).)
+- **Dependency ordering is invisible to the tests.** `depends_on` is not an
+  attribute, so no assertion can prove that one resource outlives another on
+  destroy — the orderings in `lifecycle.tftest.hcl` assert the *attributes*
+  that implement them (`wait`, `delete_cascade`, a finalizer in a manifest),
+  never the graph edges. Check those with `terraform graph` instead:
+
+  ```bash
+  terraform graph > graph.dot
+  # everything whose pods must outlive the compute they run on should reach
+  # the node group; if one of these prints False, a destroy can deadlock
+  grep -E '"(helm_release\.(karpenter|argocd|aws_load_balancer_controller))" ->' graph.dot
+  ```
+
+  This is not academic. See **The compute has to outlive the controllers**
+  under [Destroy](#destroy).
+
 - **`terraform test` loads `terraform.tfvars`.** A `run` block with no
   `variables` of its own is therefore testing the configuration *as actually
   deployed*, not the variable defaults.

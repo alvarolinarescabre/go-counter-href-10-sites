@@ -739,6 +739,27 @@ terraform destroy
 
 It takes roughly three minutes longer than the plan suggests, deliberately.
 
+**Verify afterwards.** A destroy that reports success can still have orphaned
+something the state never owned; all five of these must come back empty:
+
+```bash
+R=eu-west-1
+aws elbv2 describe-load-balancers --region $R --query 'LoadBalancers[].LoadBalancerName'
+aws ec2 describe-instances --region $R \
+  --filters Name=tag-key,Values=karpenter.sh/nodepool Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].InstanceId'
+aws ec2 describe-volumes --region $R --filters Name=status,Values=available \
+  --query 'Volumes[].[VolumeId,Size,CreateTime]' --output text
+aws ec2 describe-network-interfaces --region $R --filters Name=status,Values=available \
+  --query 'NetworkInterfaces[].NetworkInterfaceId'
+aws ec2 describe-vpcs --region $R --query 'Vpcs[?Tags[?Value==`chamo-dev-vpc`]].VpcId'
+```
+
+The VPC is the canary: if the destroy succeeded but the VPC is still there,
+something left an ENI behind. Surviving on purpose, and not worth hunting: the
+S3 state bucket, the two `bootstrap/` IAM users, and any KMS key in
+`PendingDeletion` (KMS has no immediate delete).
+
 None of the three NLBs belong to Terraform: each is created by the AWS Load
 Balancer Controller from inside the cluster, in response to a `Service` that
 kgateway provisions for a `Gateway`. Terraform can only delete the `Gateway`
@@ -747,10 +768,12 @@ which is asynchronous. Two things keep that honest:
 
 - the Argo CD `Application`s carry `resources-finalizer.argocd.argoproj.io`, so
   deleting one cascades to the namespace, Gateway, Service and PVCs it deployed
-  instead of leaving them behind; and
+  instead of leaving them behind. Terraform blocks on that finalizer
+  (`wait = true`), which is what makes counter-api's NLB — whose Gateway
+  Terraform does not own — deterministic rather than a race; and
 - a teardown barrier (`var.load_balancer_teardown_wait`, default `180s`) holds
   the controller — and therefore the cluster — alive after the last Gateway is
-  deleted, long enough for the NLBs to actually go.
+  deleted, as margin for anything still in flight.
 
 Without those, the NLBs are orphaned mid-deletion, their ENIs keep holding the
 private subnets, and the VPC destroy fails with `DependencyViolation`. The full

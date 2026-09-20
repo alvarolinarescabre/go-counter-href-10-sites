@@ -233,6 +233,23 @@ run "gateway_deletion_waits_for_the_load_balancer" {
     condition     = kubectl_manifest.grafana_gateway[0].wait == true && kubectl_manifest.grafana_gateway[0].delete_cascade == "Foreground"
     error_message = "The Grafana Gateway no longer blocks on its Service being deleted."
   }
+
+  # The third NLB is counter-api's, and Terraform owns neither its Gateway nor
+  # its Service -- the chart creates them. What it can block on is the Argo CD
+  # Application: the resources-finalizer asserted above keeps the object in
+  # Terminating until Argo CD has pruned the Gateway, and `wait` blocks on that
+  # finalizer. Without it the delete returns mid-cascade and only
+  # time_sleep.load_balancer_teardown's timer stands between a slow NLB delete
+  # and an orphaned load balancer.
+  assert {
+    condition     = kubectl_manifest.argocd_application.wait == true
+    error_message = "The counter-api Application no longer waits for its Argo CD finalizer, so its NLB is back to being a race against the teardown timer."
+  }
+
+  assert {
+    condition     = kubectl_manifest.argocd_application.delete_cascade == "Foreground"
+    error_message = "A Background cascade defeats wait = true on the Application."
+  }
 }
 
 run "the_teardown_barrier_costs_nothing_on_apply" {
