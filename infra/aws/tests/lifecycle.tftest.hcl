@@ -252,6 +252,49 @@ run "gateway_deletion_waits_for_the_load_balancer" {
   }
 }
 
+# The EBS volumes behind the VMSingle and Grafana PVCs belong to no Terraform
+# resource: the CSI driver creates them, and only the CSI driver deletes them.
+# Two destroys leaked them (a 20Gi and a 5Gi left `available`) because nothing
+# here blocked on the deletion actually happening.
+run "pvc_deletion_is_waited_for_before_the_csi_driver_goes" {
+  command = apply
+
+  assert {
+    condition     = kubectl_manifest.monitoring_namespace[0].wait == true
+    error_message = "Without wait, Terraform fires the namespace DELETE and moves on while the PVCs -- and so the EBS volumes -- are still being removed."
+  }
+
+  assert {
+    condition     = kubectl_manifest.victoria_metrics_k8s_stack[0].wait == true && kubectl_manifest.victoria_metrics_k8s_stack[0].delete_cascade == "Foreground"
+    error_message = "The monitoring Application no longer blocks on its Argo CD finalizer, so the chart's prune (Grafana's PVC included) races the namespace delete."
+  }
+
+  # The volume delete lands on the PV a moment after the PVC is gone, and the
+  # CSI driver is an addon inside module.eks. The barrier is that moment.
+  assert {
+    condition     = time_sleep.storage_teardown.destroy_duration == "60s"
+    error_message = "The storage teardown barrier is not var.storage_teardown_wait."
+  }
+
+  assert {
+    condition     = time_sleep.storage_teardown.create_duration == null
+    error_message = "The storage barrier must cost nothing on apply -- it is a destroy-only delay."
+  }
+}
+
+run "the_storage_teardown_wait_is_tunable" {
+  command = apply
+
+  variables {
+    storage_teardown_wait = "120s"
+  }
+
+  assert {
+    condition     = time_sleep.storage_teardown.destroy_duration == "120s"
+    error_message = "var.storage_teardown_wait is not reaching the barrier."
+  }
+}
+
 run "the_teardown_barrier_costs_nothing_on_apply" {
   command = apply
 

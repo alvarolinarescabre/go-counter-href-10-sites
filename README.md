@@ -775,6 +775,12 @@ which is asynchronous. Two things keep that honest:
   the controller — and therefore the cluster — alive after the last Gateway is
   deleted, as margin for anything still in flight.
 
+The EBS volumes behind the VMSingle and Grafana PVCs work the same way and get
+the same treatment: the CSI driver is the only thing that can delete them, the
+monitoring `Application` and namespace both block until their PVCs are really
+gone, and `var.storage_teardown_wait` (default `60s`) keeps the driver alive
+across the last asynchronous step.
+
 Without those, the NLBs are orphaned mid-deletion, their ENIs keep holding the
 private subnets, and the VPC destroy fails with `DependencyViolation`. The full
 explanation, the resulting order, and what to do if a destroy still leaves

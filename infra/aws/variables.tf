@@ -582,3 +582,24 @@ variable "keda_sync_wait" {
   type        = string
   default     = "120s"
 }
+
+
+variable "storage_teardown_wait" {
+  description = <<-EOT
+    How long `terraform destroy` holds module.eks -- and therefore the EBS CSI
+    driver addon and the nodes it runs on -- alive after the monitoring
+    namespace is gone, so the driver can finish deleting the volumes behind the
+    VMSingle and Grafana PVCs.
+
+    Nothing in Terraform owns those volumes. Deleting a PVC returns before the
+    PV it was bound to is released and the EBS volume behind it deleted -- see
+    time_sleep.storage_teardown in 11-monitoring.tf. An EBS delete takes a few
+    seconds, well under the NLB equivalent, so this is much shorter than
+    var.load_balancer_teardown_wait.
+
+    It costs nothing on apply. Raise it if a destroy still leaves `available`
+    volumes behind.
+  EOT
+  type        = string
+  default     = "60s"
+}

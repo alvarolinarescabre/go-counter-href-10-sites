@@ -76,6 +76,27 @@ resource "kubectl_manifest" "gp3_storage_class" {
 
 # ------------------------------------------------------------------ Stack
 
+################################################################################
+# Teardown barrier for the EBS CSI driver -- the storage twin of
+# time_sleep.load_balancer_teardown in 09-load-balancer-controller.tf.
+#
+# Nothing in Terraform owns the EBS volumes behind the VMSingle and Grafana
+# PVCs. The CSI driver creates them and only the CSI driver deletes them, and
+# it is an EKS addon inside module.eks -- so it disappears with the cluster.
+#
+# The namespace's `wait` below blocks until the PVCs are gone, but the volume
+# delete happens a moment after that, on the PV the PVC was bound to. This
+# barrier is that moment: on destroy it holds module.eks -- the addon, and the
+# nodes it runs on -- alive for var.storage_teardown_wait after the namespace
+# is really gone. On create it is a no-op (no create_duration).
+################################################################################
+
+resource "time_sleep" "storage_teardown" {
+  depends_on = [module.eks]
+
+  destroy_duration = var.storage_teardown_wait
+}
+
 resource "kubectl_manifest" "monitoring_namespace" {
   count = var.enable_monitoring ? 1 : 0
 
@@ -87,11 +108,22 @@ resource "kubectl_manifest" "monitoring_namespace" {
     }
   })
 
-  # Deleting the namespace blocks on the finalizers of everything still in it --
-  # Grafana's LoadBalancer Service among them. The barrier is what keeps the
-  # load balancer controller alive to clear those, instead of leaving the
-  # namespace stuck Terminating and the NLB orphaned.
-  depends_on = [module.eks, time_sleep.load_balancer_teardown]
+  # A namespace delete blocks on the finalizers of everything still inside it,
+  # and `wait` is what makes TERRAFORM block on that rather than firing the
+  # DELETE and moving on. Two things depend on it:
+  #
+  #   - Grafana's LoadBalancer Service, whose finalizer the load balancer
+  #     controller clears only once the NLB is gone.
+  #   - The VMSingle and Grafana PVCs. kubernetes.io/pvc-protection keeps a PVC
+  #     alive until no pod uses it; once the PVC object goes, the PV it is
+  #     bound to is released and the gp3 StorageClass's reclaimPolicy = Delete
+  #     has the EBS CSI driver delete the volume behind it.
+  #
+  # Without `wait`, Terraform moved on while both were still in flight -- which
+  # is how the 20Gi VMSingle and 5Gi Grafana volumes survived two destroys.
+  wait = true
+
+  depends_on = [module.eks, time_sleep.storage_teardown, time_sleep.load_balancer_teardown]
 }
 
 resource "kubectl_manifest" "victoria_metrics_k8s_stack" {
@@ -155,6 +187,14 @@ resource "kubectl_manifest" "victoria_metrics_k8s_stack" {
   # pods (VMSingle, Grafana, node-exporter, kube-state-metrics) sit on
   # Karpenter-provisioned nodes, and they have to be gone before the NodePool is
   # drained rather than during it.
+  # Same reasoning as kubectl_manifest.argocd_application in 05-app-deployment.tf:
+  # the Application carries resources-finalizer.argocd.argoproj.io, and `wait`
+  # blocks on it, so this delete returns only once Argo CD has pruned the chart
+  # -- Grafana's PVC included. Without it the prune raced the namespace delete
+  # below and both raced the EBS CSI driver's removal.
+  wait           = true
+  delete_cascade = "Foreground"
+
   depends_on = [
     kubectl_manifest.monitoring_namespace,
     kubectl_manifest.gp3_storage_class,

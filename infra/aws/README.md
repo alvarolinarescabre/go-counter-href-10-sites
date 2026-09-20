@@ -478,6 +478,38 @@ guessing:
 The resulting order is `workloads → NodePool (drains, terminates) → Karpenter
 controller → cluster`.
 
+### The EBS volumes
+
+Same shape as the load balancers: the volumes behind the VMSingle and Grafana
+PVCs belong to no Terraform resource. The EBS CSI driver creates them, and only
+the EBS CSI driver deletes them — and it is an EKS addon *inside* `module.eks`,
+so it disappears with the cluster.
+
+The gp3 StorageClass already sets `reclaimPolicy: Delete`, so the policy was
+never the problem. The ordering was: neither the monitoring `Application` nor
+the namespace blocked on their deletes, so Terraform fired both and moved on
+while the PVCs were still terminating. Two destroys leaked a 20Gi and a 5Gi
+volume that way, left `available` and billed.
+
+The chain, and what now blocks on each link:
+
+```text
+Application deleted  (wait: blocks on the Argo CD finalizer -> chart pruned,
+                      Grafana's PVC with it)
+  -> namespace deleted (wait: blocks on the namespace finalizer, which is not
+                        cleared until every PVC inside is gone --
+                        kubernetes.io/pvc-protection holds each one until no
+                        pod uses it)
+  -> the PV each PVC was bound to is released
+  -> reclaimPolicy: Delete -> the CSI driver deletes the EBS volume
+  -> 60s barrier (time_sleep.storage_teardown) keeps module.eks, the addon and
+     its nodes alive across that last step
+  -> module.eks
+```
+
+Only the last link is asynchronous, and `var.storage_teardown_wait` is the
+margin around it. Raise it if a destroy still leaves `available` volumes.
+
 ### The compute has to outlive the controllers
 
 Karpenter, the load balancer controller and Argo CD are all *pods*. Each one
@@ -584,7 +616,10 @@ The resulting order is:
 Applications (cascade: pods, Gateways, Services, PVCs)
   -> Karpenter NodePool   (blocks until every instance is terminated)
   -> Applications         (block on the Argo CD finalizer: the counter-api
-                           Gateway, its Service and its NLB are gone first)
+                           Gateway, its Service and its NLB are gone first;
+                           the monitoring chart and Grafana's PVC likewise)
+  -> monitoring namespace (blocks until every PVC in it is gone)
+  -> 60s storage barrier  (the CSI driver deletes the EBS volumes)
   -> Gateways Terraform owns (block until their NLB is gone)
   -> 180s barrier         (margin for anything still in flight)
   -> Karpenter controller + load balancer controller
@@ -651,7 +686,7 @@ cd infra/aws
 terraform test
 ```
 
-74 tests across seven files in [`tests/`](tests). **They need no AWS credentials
+76 tests across seven files in [`tests/`](tests). **They need no AWS credentials
 and touch nothing** — every provider is replaced by a `mock_provider`, so a run
 never reaches an API, never reads or writes the S3 state, and never sees the
 real cluster. A full run takes about three minutes.
@@ -664,7 +699,7 @@ real cluster. A full run takes about three minutes.
 | `karpenter_and_ecr.tftest.hcl` | NodePool requirements and the CPU ceiling, EC2NodeClass discovery tags, the spot service-linked role, ECR immutability and the lifecycle rules |
 | `monitoring.tftest.hcl` | The gp3 StorageClass, VMSingle/Grafana storage, the components deliberately left off, and the Argo CD sync options the chart's quirks need |
 | `keda.tftest.hcl` | The Argo CD Application's chart coordinates and sync options, the `caBundle` ignores that keep the webhooks working across a sync, the two-replica metrics apiserver and its PDB, and the barrier the application waits on |
-| `lifecycle.tftest.hcl` | The orderings that only fail against a real cluster: on the way up, the wait for Argo CD to sync kgateway's CRDs and the disabled Service mutator webhook; on the way down, the cascade finalizers and the teardown barrier described under [Destroy](#destroy) |
+| `lifecycle.tftest.hcl` | The orderings that only fail against a real cluster: on the way up, the wait for Argo CD to sync kgateway's CRDs and the disabled Service mutator webhook; on the way down, the cascade finalizers, the `wait`s that block on them, and the two teardown barriers (load balancers, storage) described under [Destroy](#destroy) |
 
 Useful flags:
 
@@ -911,6 +946,7 @@ already exists.
 | `monitoring_retention` | VMSingle retention | `15d` |
 | `monitoring_storage_size` | VMSingle gp3 volume size | `20Gi` |
 | `enable_grafana_route` | Publish Grafana through its own Gateway/NLB | `true` |
+| `storage_teardown_wait` | How long to hold the EBS CSI driver alive after the monitoring namespace is gone, so it can delete the PVCs' volumes | `60s` |
 | `enable_keda` | Install KEDA via Argo CD. Flip together with `autoscaling.keda.enabled` in the Helm values, or the app ends up with no autoscaler | `true` |
 | `keda_namespace` | Namespace for the KEDA operator, adapter and webhooks | `keda` |
 | `keda_chart_version` | kedacore/keda chart version (tracks appVersion) | `2.20.2` |
