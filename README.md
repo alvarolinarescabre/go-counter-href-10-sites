@@ -11,11 +11,11 @@ The repository also contains the entire AWS execution platform:
 - Argo CD to synchronize Kubernetes from Git.
 - Gateway API + kgateway to publish the application via an NLB.
 - Helm to package the `counter-api` deployment.
-- GitHub Actions to build the image, publish it to ECR, and update the tag
-  that Argo CD synchronizes.
+- Two GitHub Actions workflows: one deploys the code, one deploys the
+  infrastructure.
 - VictoriaMetrics + Grafana for cluster and application metrics.
-- Horizontal Pod Autoscalers for the application and its gateway proxy, with
-  zero-downtime rollouts.
+- KEDA scaling the application on the request rate it actually serves, and a
+  plain CPU HPA for the gateway proxy, with zero-downtime rollouts.
 - An in-cluster load test that exercises the public path (NLB -> gateway -> app).
 
 ## Architecture and deployment flow
@@ -30,15 +30,17 @@ GitHub Actions -- build Docker -- push ECR -- update values.yaml
 Git Repository <- Argo CD <- Application <- Helm chart
                                       |
                                       v
-                   Deployment + HPA + Service + Gateway + HTTPRoute
+           Deployment + ScaledObject + Service + Gateway + HTTPRoute
                                       |
                                       v
-                AWS NLB -> kgateway proxy (HPA) -> counter-api (HPA)
+             AWS NLB -> kgateway proxy (HPA) -> counter-api (KEDA)
                                                         |
                                                   :9090/metrics
                                                         |
                                                         v
                             vmagent -> VMSingle (EBS gp3) <- Grafana
+                                           |
+                                           +--> KEDA --> keda-hpa-counter-api
 ```
 
 Terraform is used to create the platform and hand control to Argo CD.
@@ -54,11 +56,13 @@ apps/counter-api/loadtest/     Load generators, stub origin, in-cluster Job
 deploy/helm/counter-api/       Helm chart for the application
 deploy/argocd/                 Application, AppProject, and kgateway
 deploy/monitoring/dashboards/  Grafana dashboards shipped by Terraform
-infra/aws/                     Terraform for AWS/EKS (11-monitoring.tf: metrics)
+infra/aws/                     Terraform for AWS/EKS (11-monitoring.tf: metrics,
+                               12-keda.tf: autoscaling)
 infra/aws/tests/               `terraform test` suite for the AWS stack
 infra/aws/bootstrap/           Initial IAM for GitHub Actions
 infra/aws/bootstrap/tests/     `terraform test` suite for the bootstrap root
-.github/workflows/deploy.yml   Build, push to ECR, and GitOps promotion
+.github/workflows/deploy.yml         Code: build, push to ECR, GitOps promotion
+.github/workflows/terraform-aws.yml  Infrastructure: validate, test, plan, apply
 ```
 
 ## Requirements
@@ -437,7 +441,8 @@ Two prerequisites are part of the same Terraform:
 
 - **EBS CSI driver addon** plus a default `gp3` StorageClass. Without EKS Auto
   Mode nothing else can provision the persistent volumes.
-- **metrics-server addon**, needed by every HorizontalPodAutoscaler.
+- **metrics-server addon**, needed by every HorizontalPodAutoscaler — including
+  the one KEDA generates, whose CPU trigger reads from it.
 
 ### Application metrics
 
@@ -486,7 +491,7 @@ fronts it:
 
 | | `counter-api` | Gateway proxy (Envoy) |
 |---|---|---|
-| Autoscaling | HPA 3–24 pods, 70% CPU | HPA 2–6 replicas, 50% CPU (created by kgateway from `GatewayParameters`) |
+| Autoscaling | KEDA 3–24 pods, on request rate + CPU | HPA 2–6 replicas, 50% CPU (created by kgateway from `GatewayParameters`) |
 | Disruption budget | `maxUnavailable: 25%` | `minAvailable: 1` |
 | Shutdown | `preStop` sleep 10s, then graceful HTTP shutdown | Envoy graceful drain 10s |
 | Placement | Anywhere | Karpenter nodes only, spread across nodes |
@@ -507,20 +512,96 @@ fronts it:
 - A kgateway `TrafficPolicy` retries once on `reset` or `connect-failure`. Every
   route is a `GET`, so the retry is safe.
 
+### KEDA on the application
+
+KEDA does **not** replace the HorizontalPodAutoscaler. A `ScaledObject` creates
+one — `keda-hpa-counter-api` — and KEDA registers itself as the external metrics
+API server that feeds it. What changes is the input.
+
+The reason is in the numbers from the load test below: at 5000 rps the pods used
+~0.1 core each against a 100m request, so CPU sits near 100% of request across
+most of the useful range. It is a flat, late signal. `counter_api_http_requests_total`
+is the direct one.
+
+The `ScaledObject` carries two triggers:
+
+| Trigger | Target | Source |
+|---|---|---|
+| `prometheus` | 210 rps per pod | `sum(rate(counter_api_http_requests_total[2m]))` against VMSingle |
+| `cpu` | 70% of request | metrics-server, same as before |
+
+- The HPA takes the **highest** replica count the two ask for, which is what
+  makes CPU a safety net rather than a second opinion. If VictoriaMetrics stops
+  answering, the request-rate metric goes unavailable and the HPA keeps scaling
+  up on CPU alone — and refuses to scale *down* while a metric is missing.
+- The 210 comes from the load test: 5000 rps across 24 pods is ~208 each, so
+  that peak lands exactly on `maxReplicas` instead of permanently asking for one
+  pod more than the ceiling allows.
+- The query window is `[2m]` over a 30s scrape interval — four samples, so the
+  rate survives one missed scrape. At `[1m]` it is two, and a single miss leaves
+  the query with nothing to report.
+- The `behavior` block (instant scale-up, 25%-per-minute scale-down over a 5
+  minute window) is shared: KEDA passes it straight through to the HPA it
+  generates, so flipping `autoscaling.keda.enabled` does not silently change how
+  the app reacts.
+- `templates/hpa.yaml` renders **only** when `autoscaling.keda.enabled` is
+  `false`. Two HPAs on one Deployment overwrite each other's decisions every
+  sync interval, so the chart makes them mutually exclusive.
+- The gateway proxy keeps its own CPU HPA: kgateway creates it from
+  `GatewayParameters`, and taking it over would mean fighting the controller for
+  `spec.replicas`.
+
+Controller install and its variables (`enable_keda`, `keda_chart_version`,
+`keda_sync_wait`) are in [`infra/aws/12-keda.tf`](infra/aws/12-keda.tf).
+
+**Rollout order matters.** The chart renders its `ScaledObject` only once
+`keda.sh/v1alpha1` is a registered API, and with `autoscaling.keda.enabled` it
+renders no plain HPA either. On a running cluster, `terraform apply` the KEDA
+install *before* the chart change reaches `main` — otherwise Argo CD prunes the
+old HPA, renders nothing in its place, and the Deployment sits with no
+autoscaler until the next reconcile. On a cold apply the `depends_on` in
+`05-app-deployment.tf` enforces the order for you.
+
 All of this is configurable under `rollout`, `podDisruptionBudget`,
 `autoscaling`, `gatewayParameters.proxy`, and `gatewayPolicies` in
 [`values.yaml`](deploy/helm/counter-api/values.yaml).
 
 ## Automatic deployment with GitHub Actions
 
-The workflow [`deploy.yml`](.github/workflows/deploy.yml) runs on push to `main`
-except for changes affecting only Markdown or `docs/`, and also supports
-`workflow_dispatch`.
+There are exactly two workflows, one per half of the system:
 
-The workflow registers the deployment in Port, obtains AWS credentials, builds
-`apps/counter-api/Dockerfile`, publishes the image to ECR with tag `${GITHUB_SHA}`,
-updates `image.tag`, and pushes the change. Argo CD detects that commit and
-synchronizes the Deployment.
+| Workflow | Deploys | Runs on |
+|---|---|---|
+| [`deploy.yml`](.github/workflows/deploy.yml) | The code | Push to `main` (except Markdown-only and `docs/`), or manual dispatch |
+| [`terraform-aws.yml`](.github/workflows/terraform-aws.yml) | The infrastructure | PR and push to `main` for checks; `apply`/`destroy` by manual dispatch only |
+
+`deploy.yml` registers the deployment in Port, obtains AWS credentials, builds
+`apps/counter-api/Dockerfile`, publishes the image to ECR tagged with the commit
+sha, bumps `image.tag` in the Helm values, and pushes. Argo CD detects that
+commit and synchronizes the Deployment. It never talks to the cluster itself.
+`terraform-aws.yml` is documented in
+[`infra/aws/README.md`](infra/aws/README.md#continuous-deployment).
+
+### Dispatching a deploy by hand
+
+Three optional inputs, all aimed at one situation: `terraform destroy` brings
+the ECR repository back **empty**, because `force_delete = true` in
+[`07-ecr.tf`](infra/aws/07-ecr.tf) takes the images with it. The cluster then
+asks for a tag that no longer resolves and the pods sit in `ImagePullBackOff`.
+
+| Input | Default | What it does |
+|---|---|---|
+| `ref` | the dispatch branch | Commit, branch or tag to build |
+| `image_tag` | sha of the built commit | Tag to publish |
+| `update_gitops` | `true` | Whether to bump `image.tag`, i.e. whether to actually deploy it |
+
+Dispatching with `ref` set to the commit the running Deployment references
+republishes exactly the tag it is asking for, with no git commit needed. Setting
+`update_gitops: false` republishes an image without moving what the cluster runs.
+
+The repository is `IMMUTABLE`, so the workflow checks whether the tag is already
+published and skips the build if it is — which makes re-running a finished run
+an idempotent redeploy instead of a failed push after a full build.
 
 Configure in GitHub:
 
@@ -734,6 +815,31 @@ under `apps/` and `deploy/helm/` only reach the cluster after they are pushed to
 
 **An HPA shows `cpu: <unknown>`.** metrics-server is missing or not ready, or
 the target pods have no CPU request. Check `kubectl top pods -n counter-api`.
+
+**The Deployment has no autoscaler at all.** Usually the rollout order above:
+the chart change reached `main` before KEDA was installed, so Argo CD pruned the
+old HPA and rendered nothing in its place. Check that the API exists and that
+the object was created:
+
+```bash
+kubectl get scaledobject -n counter-api
+kubectl get hpa -n counter-api            # expect keda-hpa-counter-api
+kubectl get pods -n keda
+```
+
+**The `ScaledObject` shows `READY: False`.** KEDA cannot reach VictoriaMetrics
+or the query returns nothing. The operator log names the failing trigger:
+
+```bash
+kubectl -n keda logs deploy/keda-operator | grep -i scaler
+# verify the query by hand:
+kubectl -n monitoring port-forward svc/vmsingle-victoria-metrics-k8s-stack 8428 &
+curl -sG http://127.0.0.1:8428/prometheus/api/v1/query \
+  --data-urlencode 'query=sum(rate(counter_api_http_requests_total[2m]))'
+```
+
+The CPU trigger keeps scaling the app up while this is broken, so it degrades
+rather than fails.
 
 **Argo CD fails with `.status.terminatingReplicas: field not declared in
 schema`.** The Argo CD version is older than the cluster's Kubernetes version.

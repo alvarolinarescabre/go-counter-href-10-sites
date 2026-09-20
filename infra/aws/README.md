@@ -100,6 +100,7 @@ manifests and then hands off control to Argo CD's own sync loop.
     ├── 09-load-balancer-controller.tf # AWS Load Balancer Controller (IAM via Pod Identity + Helm)
     ├── 10-cluster-access.tf           # Human access: Identity Center permission sets + break-glass role
     ├── 11-monitoring.tf               # EBS CSI + gp3 StorageClass, VictoriaMetrics/Grafana, Grafana Gateway
+    ├── 12-keda.tf                     # KEDA via ArgoCD: request-rate autoscaling for counter-api
     ├── policies/                      # Vendored upstream IAM policy documents
     ├── tests/                         # `terraform test` suite for this root (see Tests below)
     └── bootstrap/                     # Separate root: the two CI IAM users and their policies
@@ -275,6 +276,30 @@ reviews cannot see.
 - **counter-api metrics**: the app serves Prometheus metrics on `:9090/metrics` (never
   routed by the Gateway); its chart adds a `VMServiceScrape` once the operator CRDs
   exist, and the `counter-api` dashboard ships from `deploy/monitoring/dashboards/`.
+
+### Autoscaling (`12-keda.tf`)
+- **Application** `keda` (Argo CD, namespace `keda`, chart `kedacore/keda`
+  `keda_chart_version`): the operator, the admission webhooks, and the aggregated
+  `external.metrics.k8s.io` apiserver that feeds request-rate metrics to the HPA.
+- KEDA **does not replace the HPA**. The `ScaledObject` in the application chart
+  creates `keda-hpa-counter-api`; KEDA only supplies its external metric. The
+  gateway proxy keeps the plain CPU HPA kgateway builds from `GatewayParameters`.
+- The metrics apiserver runs **two replicas with a PDB**: while it is unreachable
+  every ScaledObject-backed HPA reports `unable to fetch metrics` and freezes its
+  replica count, and with Karpenter on spot a single replica would mean that on
+  every reclaim.
+- `ignoreDifferences` covers the `caBundle` on the `keda-admission` webhooks and
+  on the `v1beta1.external.metrics.k8s.io` APIService. The operator mints its own
+  serving certificates and patches those in; the chart renders them empty, so
+  without this `selfHeal` wipes them on every sync. `keda-admission` has **six**
+  webhook entries, hence a `jqPathExpressions` over all of them rather than a
+  `/webhooks/0` pointer.
+- `time_sleep.wait_for_keda_crds` gates `05-app-deployment.tf`: the chart renders
+  its `ScaledObject` only once `keda.sh/v1alpha1` is registered, and renders no
+  plain HPA when KEDA is enabled — so syncing the application too early leaves the
+  Deployment with no autoscaler at all. Same race as `kgateway_sync_wait`.
+- The trigger queries VMSingle, so this also depends on `enable_monitoring`. With
+  monitoring off only the CPU trigger reports and the `ScaledObject` sits failed.
 
 ### Argo CD ingress (`06-argocd-ingress.tf`, optional)
 
@@ -570,10 +595,10 @@ cd infra/aws
 terraform test
 ```
 
-63 tests across six files in [`tests/`](tests). **They need no AWS credentials
+74 tests across seven files in [`tests/`](tests). **They need no AWS credentials
 and touch nothing** — every provider is replaced by a `mock_provider`, so a run
 never reaches an API, never reads or writes the S3 state, and never sees the
-real cluster. A full run takes about 70 seconds.
+real cluster. A full run takes about three minutes.
 
 | File | What it pins |
 |---|---|
@@ -582,6 +607,7 @@ real cluster. A full run takes about 70 seconds.
 | `argocd_ingress.tftest.hcl` | The Gateway create-vs-reuse logic, TLS termination at the NLB, listener and `parentRef` wiring, host matching, and the off switches |
 | `karpenter_and_ecr.tftest.hcl` | NodePool requirements and the CPU ceiling, EC2NodeClass discovery tags, the spot service-linked role, ECR immutability and the lifecycle rules |
 | `monitoring.tftest.hcl` | The gp3 StorageClass, VMSingle/Grafana storage, the components deliberately left off, and the Argo CD sync options the chart's quirks need |
+| `keda.tftest.hcl` | The Argo CD Application's chart coordinates and sync options, the `caBundle` ignores that keep the webhooks working across a sync, the two-replica metrics apiserver and its PDB, and the barrier the application waits on |
 | `lifecycle.tftest.hcl` | The orderings that only fail against a real cluster: on the way up, the wait for Argo CD to sync kgateway's CRDs and the disabled Service mutator webhook; on the way down, the cascade finalizers and the teardown barrier described under [Destroy](#destroy) |
 
 Useful flags:
@@ -629,6 +655,11 @@ Worth knowing before adding to them:
   calls nothing.
 
 ## Continuous deployment
+
+The repository has exactly two workflows: this one deploys the infrastructure,
+and [`deploy.yml`](../../.github/workflows/deploy.yml) deploys the code. They
+share no steps and use different IAM users — see
+[3. GitHub repo configuration](#3-github-repo-configuration).
 
 [`.github/workflows/terraform-aws.yml`](../../.github/workflows/terraform-aws.yml) runs
 Terraform against AWS from GitHub Actions:
@@ -808,6 +839,10 @@ already exists.
 | `monitoring_retention` | VMSingle retention | `15d` |
 | `monitoring_storage_size` | VMSingle gp3 volume size | `20Gi` |
 | `enable_grafana_route` | Publish Grafana through its own Gateway/NLB | `true` |
+| `enable_keda` | Install KEDA via Argo CD. Flip together with `autoscaling.keda.enabled` in the Helm values, or the app ends up with no autoscaler | `true` |
+| `keda_namespace` | Namespace for the KEDA operator, adapter and webhooks | `keda` |
+| `keda_chart_version` | kedacore/keda chart version (tracks appVersion) | `2.20.2` |
+| `keda_sync_wait` | How long to wait for Argo CD to sync KEDA before creating the counter-api Application | `120s` |
 | `grafana_hostname` | Hostname the Grafana HTTPRoute matches | `grafana.alvarolinarescabre.com` |
 
 Naming is derived in [locals.tf](locals.tf) as `<project_name>-<environment>`, e.g.
