@@ -1,13 +1,57 @@
 # Fixed replica count, only used when autoscaling.enabled is false.
 replicaCount: 24
-# CPU-based HPA (needs metrics-server). Utilization is measured against
-# resources.requests.cpu. At 5000 rps the pods used ~0.1 core each, so the
-# floor handles normal traffic and the ceiling matches the old fixed count.
+# Autoscaling. The floor handles normal traffic and the ceiling matches the
+# old fixed replicaCount. Which autoscaler is created depends on keda.enabled
+# below; the bounds, the behavior and the CPU target are shared by both.
 autoscaling:
   enabled: true
   minReplicas: 3
   maxReplicas: 24
+  # Utilization measured against resources.requests.cpu (100m). At 5000 rps
+  # the pods used ~0.1 core each, so CPU sits near 100% of request across most
+  # of the useful range -- a flat, late signal, which is the reason for the
+  # request-rate trigger below.
   targetCPUUtilizationPercentage: 70
+  # Scale up at once on a burst; scale down slowly so a dip between waves of
+  # traffic does not throw away pods that are needed again a minute later.
+  # Applied to the plain HPA and to the one KEDA generates alike, so flipping
+  # keda.enabled does not silently change how the app reacts.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+  # KEDA does not replace the HPA -- a ScaledObject creates one (keda-hpa-*)
+  # and KEDA feeds it through the external metrics API. What it buys here is
+  # scaling on the request rate the app actually serves instead of on CPU.
+  # Needs var.enable_keda in infra/aws; with this on, templates/hpa.yaml is
+  # not rendered, so the two can never fight over the same Deployment.
+  keda:
+    enabled: true
+    # KEDA re-runs the query on this interval and serves the result from cache
+    # to the HPA. Shorter than the 30s scrape below on purpose: it costs one
+    # cheap query and means a fresh sample is acted on as soon as it lands.
+    pollingInterval: 15
+    prometheus:
+      # VMSingle's Prometheus-compatible query API. Namespace follows
+      # var.monitoring_namespace; the service name is the chart's release
+      # name. Verify with:
+      #   kubectl -n monitoring get svc vmsingle-victoria-metrics-k8s-stack
+      serverAddress: http://vmsingle-victoria-metrics-k8s-stack.monitoring.svc:8428/prometheus
+      # A 2m window over a 30s scrape interval (metrics.serviceScrape.interval)
+      # is four samples, so the rate survives one missed scrape. At [1m] it is
+      # two, and a single miss leaves the query with nothing to report.
+      query: sum(rate(counter_api_http_requests_total[2m]))
+      # Target requests per second per pod. The query returns the fleet total
+      # and the HPA divides by the replica count. The load test served 5000 rps
+      # on 24 pods, i.e. ~208 rps each: 210 makes that peak land exactly on
+      # maxReplicas rather than permanently asking for one pod more than the
+      # ceiling allows.
+      threshold: "210"
 revisionHistoryLimit: 2
 # Zero-downtime rollouts: new pods must be Ready before an old one is removed,
 # and a removed pod keeps serving until the gateway has stopped routing to it.

@@ -1,4 +1,9 @@
-{{- if .Values.autoscaling.enabled }}
+{{- /*
+  The plain CPU HPA. Rendered only when KEDA is NOT driving the Deployment:
+  KEDA's ScaledObject generates an HPA of its own, and two HPAs on one
+  Deployment overwrite each other's replica decisions every sync interval.
+*/}}
+{{- if and .Values.autoscaling.enabled (not .Values.autoscaling.keda.enabled) }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -20,14 +25,5 @@ spec:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
   behavior:
-    # Scale up at once on a burst; scale down slowly so a dip between waves of
-    # traffic does not throw away pods that are needed again a minute later.
-    scaleUp:
-      stabilizationWindowSeconds: 0
-    scaleDown:
-      stabilizationWindowSeconds: 300
-      policies:
-        - type: Percent
-          value: 25
-          periodSeconds: 60
+    {{- toYaml .Values.autoscaling.behavior | nindent 4 }}
 {{- end }}

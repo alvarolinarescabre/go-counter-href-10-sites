@@ -21,9 +21,16 @@ resource "kubectl_manifest" "argocd_application" {
   # before Karpenter starts draining. A PDB cannot block the eviction of a pod
   # that no longer exists; with the workloads still running, the NodePool delete
   # blocks behind them.
+  #
+  # wait_for_keda_crds: the chart renders its ScaledObject only if
+  # keda.sh/v1alpha1 is a registered API (see scaledobject.yaml), and with
+  # autoscaling.keda.enabled the plain HPA is not rendered at all. Syncing
+  # before KEDA is up would leave the Deployment with no autoscaler until Argo
+  # CD's next reconcile.
   depends_on = [
     kubectl_manifest.argocd_app_project,
     kubectl_manifest.karpenter_node_pool,
     time_sleep.load_balancer_teardown,
+    time_sleep.wait_for_keda_crds,
   ]
 }

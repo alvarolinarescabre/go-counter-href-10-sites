@@ -1,0 +1,50 @@
+{{- /*
+  Guarded on the CRD being registered, like the VMServiceScrape: without it a
+  sync against a cluster where KEDA has not finished installing fails whole
+  ("isn't valid for cluster") and the Deployment does not update either.
+
+  The cost of the guard is that a premature sync renders no autoscaler at all,
+  since hpa.yaml is off whenever this is on. time_sleep.wait_for_keda_crds in
+  infra/aws/12-keda.tf is what keeps Terraform from handing the application to
+  Argo CD before the API exists.
+*/}}
+{{- if and .Values.autoscaling.enabled .Values.autoscaling.keda.enabled (.Capabilities.APIVersions.Has "keda.sh/v1alpha1/ScaledObject") }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "counter-api.fullname" . }}
+  labels:
+    {{- include "counter-api.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "counter-api.fullname" . }}
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  pollingInterval: {{ .Values.autoscaling.keda.pollingInterval }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      # Same behavior the plain HPA uses -- KEDA passes it straight through to
+      # the HPA it generates.
+      behavior:
+        {{- toYaml .Values.autoscaling.behavior | nindent 8 }}
+  # Two triggers, and the HPA takes the highest replica count the two ask for.
+  # That is what makes CPU a safety net rather than a second opinion: if
+  # VictoriaMetrics stops answering, the request-rate metric goes unavailable
+  # and the HPA keeps scaling up on CPU alone (it will refuse to scale *down*
+  # while a metric is missing, which is the safe direction to fail in).
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.autoscaling.keda.prometheus.serverAddress | quote }}
+        query: {{ .Values.autoscaling.keda.prometheus.query | quote }}
+        threshold: {{ .Values.autoscaling.keda.prometheus.threshold | quote }}
+    - type: cpu
+      # Utilization is a percentage of resources.requests.cpu, matching what
+      # the plain HPA did. KEDA requires the container to declare a CPU
+      # request for this trigger -- resources.requests.cpu below.
+      metricType: Utilization
+      metadata:
+        value: {{ .Values.autoscaling.targetCPUUtilizationPercentage | quote }}
+{{- end }}

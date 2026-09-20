@@ -533,3 +533,49 @@ variable "grafana_hostname" {
   type        = string
   default     = "grafana.alvarolinarescabre.com"
 }
+
+
+variable "enable_keda" {
+  description = <<-EOT
+    Install KEDA through Argo CD.
+
+    Turning this off does NOT put the counter-api back on a plain CPU HPA: the
+    chart picks the autoscaler from autoscaling.keda.enabled in
+    deploy/helm/counter-api/values.yaml, and the two have to be flipped
+    together or the Deployment ends up with no autoscaler at all.
+
+    KEDA's request-rate trigger queries VMSingle, so it also depends on
+    var.enable_monitoring. With monitoring off, only the CPU trigger still
+    reports and the ScaledObject sits in a failed state.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "keda_namespace" {
+  description = "Namespace for the KEDA operator, its metrics adapter and admission webhooks."
+  type        = string
+  default     = "keda"
+}
+
+variable "keda_chart_version" {
+  description = "Version of the kedacore/keda Helm chart. The chart version tracks the KEDA appVersion."
+  type        = string
+  default     = "2.20.2"
+}
+
+variable "keda_sync_wait" {
+  description = <<-EOT
+    How long to wait after applying the KEDA Argo CD Application before
+    Terraform hands the counter-api Application to Argo CD.
+
+    Same race as var.kgateway_sync_wait: 12-keda.tf only creates an
+    `Application` object, and Argo CD still has to pull the chart and sync it
+    before keda.sh/v1alpha1 is a registered API. The chart's ScaledObject is
+    guarded on that API existing, so syncing the application any earlier
+    renders it away and leaves the Deployment with no autoscaler until Argo
+    CD's next reconcile.
+  EOT
+  type        = string
+  default     = "120s"
+}
