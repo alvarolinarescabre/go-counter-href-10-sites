@@ -1,5 +1,17 @@
 name: Deploy
 
+# The application half of the pipeline: build the image, push it to ECR, and
+# move the tag the cluster pulls. Argo CD does the actual deploying -- this
+# workflow never talks to the cluster.
+#
+# Infrastructure is the other half and lives in terraform-aws.yml.
+#
+# Automatic on a push to main. The dispatch inputs exist for recovery: after a
+# `terraform destroy` the ECR repository comes back empty (force_delete = true
+# in infra/aws/07-ecr.tf takes the images with it), and dispatching with `ref`
+# set to the commit the running Deployment references republishes exactly the
+# tag it is asking for, with no git commit needed.
+
 "on":
   push:
     branches: [main]
@@ -8,10 +20,19 @@ name: Deploy
       - "docs/**"
   workflow_dispatch:
     inputs:
-      port_run_id:
-        description: "Port Run ID"
+      ref:
+        description: "Commit, branch or tag to build. Empty = the branch you dispatch from."
         required: false
         type: string
+      image_tag:
+        description: "Image tag to push. Empty = the full sha of the built commit."
+        required: false
+        type: string
+      update_gitops:
+        description: "Bump image.tag in the Helm values, which is what actually deploys it."
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -33,9 +54,36 @@ jobs:
       id-token: write
     steps:
 
-      # ✅ Checkout of the APP (without repository: — we're already in the correct repo)
+      # An empty `ref` makes checkout fall back to the triggering ref, which is
+      # what a push wants.
       - name: Checkout application source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Everything downstream reads these instead of github.event.*: on a
+      # workflow_dispatch there is no head_commit at all, so the Port step used
+      # to send a null commitMessage and an empty startedAt -- which Port
+      # rejects on format, failing the run before it ever reached the build.
+      #
+      # The inputs go through the environment rather than into the script text:
+      # a `${{ }}` expansion is pasted in before the shell runs, so an input
+      # containing shell syntax would execute here.
+      - name: Resolve build metadata
+        env:
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          # github.sha is the dispatch ref's head, not the checked-out commit.
+          sha="$(git rev-parse HEAD)"
+          {
+            echo "BUILT_SHA=${sha}"
+            echo "IMAGE_TAG=${INPUT_IMAGE_TAG:-$sha}"
+            echo "STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # Subject line only, JSON-encoded by jq: a message with a quote or
+            # a newline in it would otherwise break the properties payload.
+            echo "COMMIT_MESSAGE_JSON=$(git log -1 --format=%s | jq -Rr @json)"
+          } >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------
       # 1. Create deployment entity in Port → status: Building
@@ -49,19 +97,19 @@ jobs:
           operation: UPSERT
           identifier: ${{ github.event.repository.name }}-${{ github.run_id }}
           blueprint: deploymentRun
-          title: "${{ github.event.repository.name }} @ ${{ github.sha }}"
+          title: "${{ github.event.repository.name }} @ ${{ env.BUILT_SHA }}"
           icon: Deployment
           properties: |-
             {
               "status": "Building",
               "environment": "${{ env.ENVIRONMENT }}",
-              "commitSha": "${{ github.sha }}",
-              "commitMessage": ${{ toJSON(github.event.head_commit.message) }},
+              "commitSha": "${{ env.BUILT_SHA }}",
+              "commitMessage": ${{ env.COMMIT_MESSAGE_JSON }},
               "author": "${{ github.actor }}",
               "branch": "${{ github.ref_name }}",
-              "commitUrl": "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}",
+              "commitUrl": "${{ github.server_url }}/${{ github.repository }}/commit/${{ env.BUILT_SHA }}",
               "workflowRunUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-              "startedAt": "${{ github.event.head_commit.timestamp }}"
+              "startedAt": "${{ env.STARTED_AT }}"
             }
           relations: |-
             {
@@ -86,20 +134,43 @@ jobs:
       - name: Compose image URI
         run: echo "IMAGE_REPO=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}" >> "$GITHUB_ENV"
 
+      # image_tag_mutability = "IMMUTABLE", so re-running a finished run, or
+      # dispatching a tag that is already published, would fail on the push
+      # after a full build. Skipping the build instead makes a re-run an
+      # idempotent redeploy of the image that is already there.
+      - name: Check whether the tag is already published
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images \
+               --repository-name "${ECR_REPOSITORY}" \
+               --image-ids "imageTag=${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "::notice::${IMAGE_REPO}:${IMAGE_TAG} is already in ECR; skipping the build."
+            echo "IMAGE_EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "IMAGE_EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Set up Docker Buildx
+        if: env.IMAGE_EXISTS != 'true'
         uses: docker/setup-buildx-action@v3
 
+      # linux/amd64 only, matching var.karpenter_node_architectures: Karpenter
+      # provisions no arm64 nodes, so a multi-arch build would buy nothing.
+      # provenance: false keeps the push a plain manifest -- an attestation
+      # manifest list leaves an untagged child that rule 1 of the ECR lifecycle
+      # policy then expires out from under the image.
       - name: Build and push
+        if: env.IMAGE_EXISTS != 'true'
         uses: docker/build-push-action@v6
         with:
           context: apps/counter-api
           file: apps/counter-api/Dockerfile
           push: true
-          tags: ${{ env.IMAGE_REPO }}:${{ github.sha }}
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
           provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
 
       - name: Port | image published
         uses: port-labs/port-github-action@v1
@@ -113,19 +184,44 @@ jobs:
           properties: |-
             {
               "status": "Image pushed",
-              "imageTag": "${{ env.IMAGE_REPO }}:${{ github.sha }}"
+              "imageTag": "${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}"
             }
 
       # ------------------------------------------------------------------
-      # 3. Bump tag in GitOps repo → status: Manifest updated
+      # 3. Bump tag in GitOps repo → Argo CD takes it from here
       # ------------------------------------------------------------------
+      # Skippable so a dispatch can republish a missing image without moving
+      # what the cluster runs -- the recovery case in the header.
+      #
+      # The event_name guard is not redundant: on a push the `inputs` context
+      # is empty, and GitHub casts both an empty value and `false` to 0 before
+      # comparing, so a bare `inputs.update_gitops != false` is FALSE on every
+      # push -- silently skipping the bump on the normal deploy path.
       - name: Update GitOps manifests
+        if: github.event_name != 'workflow_dispatch' || inputs.update_gitops
         run: |
           set -euo pipefail
           git clone --depth 1 \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITOPS_REPO}.git" gitops
           cd gitops
-          yq -i '.image.tag = "${{ github.sha }}"' "deploy/helm/counter-api/values.yaml"
+          yq -i ".image.tag = \"${IMAGE_TAG}\"" "deploy/helm/counter-api/values.yaml"
+          # A dispatch that rebuilds the tag already in the values has nothing
+          # to commit, and `git commit` exits 1 on an empty tree.
+          if git diff --quiet; then
+            echo "::notice::image.tag is already ${IMAGE_TAG}; nothing to bump."
+            exit 0
+          fi
           git -c user.name="alvarolinarescabre" -c user.email="alvarolinarescabre@gmail.com" \
-            commit -am "chore(${APP_NAME}): bump a ${{ github.sha }}"
+            commit -am "chore(${APP_NAME}): bump a ${IMAGE_TAG}"
           git push
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## ${IMAGE_REPO:-ECR}:${IMAGE_TAG:-?}"
+            echo
+            echo "- built from \`${BUILT_SHA:-?}\`"
+            echo "- image already present: \`${IMAGE_EXISTS:-unknown}\`"
+            echo "- gitops bump: \`${{ github.event_name != 'workflow_dispatch' || inputs.update_gitops }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
