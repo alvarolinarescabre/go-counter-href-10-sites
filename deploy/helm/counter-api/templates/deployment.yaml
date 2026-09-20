@@ -24,6 +24,22 @@ spec:
     spec:
       # Must cover the preStop sleep plus the app's own 10s graceful shutdown.
       terminationGracePeriodSeconds: {{ .Values.rollout.terminationGracePeriodSeconds }}
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpread.constraints }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          # Count only pods of the ReplicaSet being scheduled. Without it a
+          # rollout measures skew across the old and new ReplicaSets together,
+          # and the surge pods look like imbalance that is about to disappear.
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              {{- include "counter-api.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
       containers:

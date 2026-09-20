@@ -62,7 +62,31 @@ rollout:
   terminationGracePeriodSeconds: 30
 podDisruptionBudget:
   enabled: true
+  # Worth knowing what this does and does not cover: a PDB constrains voluntary
+  # disruption -- drains, consolidation, rollouts. A spot reclaim is not
+  # voluntary. AWS takes the instance after its two-minute notice whether or
+  # not the budget allows the eviction, so the spread below is what actually
+  # limits the blast radius, and this limits the churn on top of it.
   maxUnavailable: 25%
+# Every node this runs on is spot (see var.karpenter_node_capacity_types). A
+# spot reclaim takes a whole capacity pool -- instance type *and* AZ -- not one
+# instance, so without a constraint the scheduler is free to put all three
+# minimum replicas in one zone and lose them together. The kube-scheduler's
+# built-in defaults do not save you here: they are maxSkew 3 by zone and 5 by
+# hostname, which three replicas can satisfy while sitting in a single zone.
+topologySpread:
+  enabled: true
+  constraints:
+    # ScheduleAnyway, not DoNotSchedule: KEDA scales this to 24 pods and
+    # Karpenter provisions the nodes to match. A hard constraint leaves pods
+    # Pending when a zone has run out of spot capacity -- precisely the moment
+    # scaling up matters most. A preference still steers every placement.
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
 image:
   # Must match `terraform output ecr_repository_url` from infra/aws. Nodes pull
   # it with their own node IAM role, so there is no imagePullSecret.

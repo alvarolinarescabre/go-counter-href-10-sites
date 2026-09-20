@@ -494,7 +494,7 @@ fronts it:
 | Autoscaling | KEDA 3–24 pods, on request rate + CPU | HPA 2–6 replicas, 50% CPU (created by kgateway from `GatewayParameters`) |
 | Disruption budget | `maxUnavailable: 25%` | `minAvailable: 1` |
 | Shutdown | `preStop` sleep 10s, then graceful HTTP shutdown | Envoy graceful drain 10s |
-| Placement | Anywhere | Karpenter nodes only, spread across nodes |
+| Placement | Spread across AZs and nodes (soft) | Karpenter nodes only, spread across nodes |
 
 - The Deployment uses `maxUnavailable: 0`, so new pods are Ready before old
   ones are removed.
@@ -506,6 +506,20 @@ fronts it:
 - The proxy runs on Karpenter capacity because the managed system nodes are
   burstable `t3.medium`. Karpenter itself is limited to the `c`, `m`, and `r`
   families for the same reason.
+- **Every node the app runs on is spot** (`var.karpenter_node_capacity_types`),
+  and a spot reclaim takes a whole capacity pool — instance type *and* AZ — not
+  a single instance. `topologySpread` therefore spreads replicas by zone and by
+  hostname. Both are `ScheduleAnyway`: KEDA scales this to 24 pods and a hard
+  constraint would leave them Pending when a zone runs out of spot capacity,
+  which is exactly when scaling up matters. The kube-scheduler's own defaults
+  (maxSkew 3 by zone, 5 by hostname) are too loose to help three replicas.
+- A PodDisruptionBudget does **not** cover this. It constrains voluntary
+  disruption — drains, consolidation, rollouts. AWS reclaims a spot instance
+  after its two-minute notice whether or not the budget allows the eviction, so
+  the spread is what limits the blast radius and the PDB limits the churn on
+  top of it. The on-demand managed node group exists for the same reason: the
+  controllers that would have to reschedule everything else cannot themselves
+  be on reclaimable capacity.
 - A kgateway `BackendConfigPolicy` closes idle proxy → app connections after
   30s, before the app's own 60s `IdleTimeout`. Otherwise Envoy can send a
   request on a connection the app is closing, and the request returns a 503.
